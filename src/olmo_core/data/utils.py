@@ -774,11 +774,13 @@ class SegmentTreeNode:
 
 class SegmentTree:
     def __init__(self, N: int):
-        assert math.log2(N) % 1 == 0, "N should be a power of 2"
+        if N <= 0:
+            raise ValueError("N must be positive")
+        tree_size = 1 << (N - 1).bit_length()
         self.root_node = SegmentTreeNode()
         self.leaf_nodes: List[SegmentTreeNode] = []
 
-        max_depth = int(math.log2(N))
+        max_depth = int(math.log2(tree_size))
         leaf_id = 0
         queue: deque[Tuple[SegmentTreeNode, int]] = deque([(self.root_node, 0)])
         while queue:
@@ -792,8 +794,8 @@ class SegmentTree:
                 self.leaf_nodes.append(parent)
                 leaf_id += 1
 
-        assert len(self.leaf_nodes) == N
-        self.leaf_nodes[-1].update(N)
+        assert len(self.leaf_nodes) == tree_size
+        self.leaf_nodes[N - 1].update(N)
 
     def query(self, weight: int) -> SegmentTreeNode:
         node = self.root_node
