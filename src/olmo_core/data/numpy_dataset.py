@@ -1315,29 +1315,16 @@ class NumpyPackedFSLDataset(NumpyFSLDatasetBase):
                 sources_needed.append(source_paths)
 
         if sources_needed:
-            with concurrent.futures.ProcessPoolExecutor() as executor:
-                futures = []
-                for source_paths in sources_needed:
-                    log.info(f"Packing documents from {source_paths} into instances...")
-                    future = executor.submit(
-                        run_worker_func,
-                        self._pack_documents_from_source_into_instances,
-                        *source_paths,
-                    )
-                    futures.append(future)
-
-                concurrent.futures.wait(futures, return_when="FIRST_EXCEPTION")
-
-                # Log results.
-                for source_paths, future in zip(sources_needed, futures):
-                    total_instances, total_tokens = future.result()
-                    total_padding = self.sequence_length * total_instances - total_tokens
-                    avg_padding = total_padding / total_instances
-                    log.info(
-                        f"Packed {total_tokens:,} tokens from {source_paths} into {total_instances:,d} instances "
-                        f"of sequence length {self.sequence_length:,d} using an average of "
-                        f"{avg_padding:.1f} padding tokens per instance."
-                    )
+            for source_paths in sources_needed:
+                log.info(f"Packing documents from {source_paths} into instances...")
+                total_instances, total_tokens = self._pack_documents_from_source_into_instances(*source_paths)
+                total_padding = self.sequence_length * total_instances - total_tokens
+                avg_padding = total_padding / total_instances if total_instances else 0.0
+                log.info(
+                    f"Packed {total_tokens:,} tokens from {source_paths} into {total_instances:,d} instances "
+                    f"of sequence length {self.sequence_length:,d} using an average of "
+                    f"{avg_padding:.1f} padding tokens per instance."
+                )
 
 
 class NumpyInterleavedFSLDataset(NumpyPaddedFSLDataset):

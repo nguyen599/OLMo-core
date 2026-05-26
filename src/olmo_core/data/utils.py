@@ -191,7 +191,12 @@ def iter_document_indices(
         Required to use the local data array instead of the metadata file.
     """
     if use_array_if_local is None:
-        if eos_token_id is not None and dtype is not None and not is_url(data_path):
+        metadata_path = None
+        if not is_url(data_path):
+            metadata_path = Path(data_path).with_suffix(".csv.gz")
+        if metadata_path is not None and metadata_path.is_file():
+            use_array_if_local = False
+        elif eos_token_id is not None and dtype is not None and not is_url(data_path):
             use_array_if_local = True
 
     if use_array_if_local and not is_url(data_path):
