@@ -743,7 +743,7 @@ class Trainer:
                 self._fit_epoch()
         except BaseException as exc:
             self._error = exc
-            log.error(f"Training failed due to:\n{type(exc).__name__}: {exc}")
+            log.exception("Training failed due to:")
             for callback in self._iter_callbacks():
                 callback.on_error(exc)
             # Shutdown ungracefully, i.e. without waiting on bookkeeping ops to finish and without
