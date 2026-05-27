@@ -3,6 +3,7 @@ from typing import List, Optional, TypeVar, cast
 
 import torch
 from torch.distributed import DeviceMesh
+import torch.distributed.distributed_c10d as c10d
 
 from olmo_core.distributed.parallel import (
     DataParallelType,
@@ -31,15 +32,51 @@ log = logging.getLogger(__name__)
 M = TypeVar("M", Transformer, List[Transformer])
 
 
-def _retain_mesh_refs(module: Transformer, name: str, mesh: DeviceMesh) -> None:
+def _retain_process_group_ref(refs: list, name: str, group: object) -> None:
+    refs.append((name, group))
+    group_name = getattr(group, "group_name", None)
+    if not group_name:
+        return
+    try:
+        c10d._register_process_group(group_name, group)
+    except Exception:
+        log.debug("Process group %s was already registered or could not be re-registered", group_name)
+
+
+def _retain_mesh_refs(module: object, name: str, mesh: DeviceMesh) -> None:
     """Keep process groups alive for DTensor hooks that store group names."""
     refs = getattr(module, "_olmo_core_parallel_refs", None)
     if refs is None:
         refs = []
         setattr(module, "_olmo_core_parallel_refs", refs)
     refs.append((name, mesh))
-    if mesh.ndim == 1:
-        refs.append((f"{name}_group", mesh.get_group()))
+
+    candidate_meshes = [mesh]
+    try:
+        root_mesh = mesh._get_root_mesh()
+        if root_mesh is not mesh:
+            candidate_meshes.append(root_mesh)
+            refs.append((f"{name}_root", root_mesh))
+        candidate_meshes.extend(root_mesh._flatten_mapping.values())
+    except Exception:
+        pass
+
+    seen_meshes: set[int] = set()
+    for idx, candidate in enumerate(candidate_meshes):
+        if id(candidate) in seen_meshes:
+            continue
+        seen_meshes.add(id(candidate))
+        try:
+            groups = [candidate.get_group()] if candidate.ndim == 1 else candidate.get_all_groups()
+        except Exception:
+            continue
+        for group_idx, group in enumerate(groups):
+            group_name = getattr(group, "group_name", str(group_idx))
+            _retain_process_group_ref(refs, f"{name}_mesh_{idx}_group_{group_name}", group)
+        try:
+            refs.append((f"{name}_mesh_{idx}_pg_registry", tuple(candidate._pg_registry.items())))
+        except Exception:
+            pass
 
 
 def parallelize_model(

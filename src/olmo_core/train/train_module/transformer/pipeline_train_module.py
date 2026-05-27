@@ -51,7 +51,7 @@ from olmo_core.utils import (
 
 from ...common import MetricMergeStrategy, ReduceType
 from ..train_module import EvalBatchSizeUnit, EvalBatchSpec, TrainModule
-from .common import parallelize_model
+from .common import _retain_mesh_refs, parallelize_model
 from .config import (
     TransformerActivationCheckpointingConfig,
     TransformerContextParallelConfig,
@@ -151,6 +151,8 @@ class TransformerPipelineTrainModule(TrainModule):
         self._pp_stages: Optional[List[PipelineStage]] = None
         self.pp_mesh = get_pp_mesh(self.world_mesh)
         self.pp_group = self.pp_mesh.get_group()
+        _retain_mesh_refs(self, "world_mesh", self.world_mesh)
+        _retain_mesh_refs(self, "pp_mesh", self.pp_mesh)
         self.pp_group_rank = get_rank(self.pp_group)
         self.pp_group_size = get_world_size(self.pp_group)
         self.pp_prev_rank = (self.pp_group_rank - 1) % self.pp_group_size
@@ -267,6 +269,7 @@ class TransformerPipelineTrainModule(TrainModule):
         assert self._pp_stages is not None
         pp_mesh = get_pp_mesh(self.world_mesh)
         assert pp_mesh is not None
+        _retain_mesh_refs(self, "train_pp_mesh", pp_mesh)
 
         # Determine the number of micro-batches.
         rank_batch_size = self.trainer.global_batch_size // dp_ws
