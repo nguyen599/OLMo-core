@@ -31,6 +31,17 @@ log = logging.getLogger(__name__)
 M = TypeVar("M", Transformer, List[Transformer])
 
 
+def _retain_mesh_refs(module: Transformer, name: str, mesh: DeviceMesh) -> None:
+    """Keep process groups alive for DTensor hooks that store group names."""
+    refs = getattr(module, "_olmo_core_parallel_refs", None)
+    if refs is None:
+        refs = []
+        setattr(module, "_olmo_core_parallel_refs", refs)
+    refs.append((name, mesh))
+    if mesh.ndim == 1:
+        refs.append((f"{name}_group", mesh.get_group()))
+
+
 def parallelize_model(
     model: M,
     *,
@@ -54,6 +65,8 @@ def parallelize_model(
         assert world_mesh is not None
         pp_mesh = get_pp_mesh(world_mesh)
         for m in model_parts:
+            _retain_mesh_refs(m, "world_mesh", world_mesh)
+            _retain_mesh_refs(m, "pp_mesh", pp_mesh)
             m.apply_pp(pp_mesh)
 
     # Maybe apply FP8 training.
@@ -67,6 +80,7 @@ def parallelize_model(
         assert world_mesh is not None
         cp_mesh = get_cp_mesh(world_mesh)
         for m in model_parts:
+            _retain_mesh_refs(m, "cp_mesh", cp_mesh)
             m.apply_cp(cp_mesh, ring=cp_config.ring, uly=cp_config.uly)
         log.info(f"Applied context parallelism to the model with {get_device_mesh_info(cp_mesh)}")
 
@@ -77,6 +91,7 @@ def parallelize_model(
         assert world_mesh is not None
         tp_mesh = get_tp_mesh(world_mesh)
         for m in model_parts:
+            _retain_mesh_refs(m, "tp_mesh", tp_mesh)
             m.apply_tp(tp_mesh)
         tp_config.maybe_enable_async_tp(tp_mesh)
         log.info(f"Applied tensor parallelism to the model with {get_device_mesh_info(tp_mesh)}")
@@ -86,6 +101,7 @@ def parallelize_model(
         assert world_mesh is not None
         ep_mesh = get_ep_mesh(world_mesh)
         for m in model_parts:
+            _retain_mesh_refs(m, "ep_mesh", ep_mesh)
             if not m.is_moe:
                 raise OLMoConfigurationError("Expert parallelism is only valid for MoE models")
             cast(MoETransformer, m).apply_ep(ep_mesh)
@@ -116,6 +132,8 @@ def parallelize_model(
         assert world_mesh is not None
         dp_mesh = get_dp_model_mesh(world_mesh)
         param_dtype = dp_config.param_dtype.as_pt() if dp_config.param_dtype is not None else None
+        for m in model_parts:
+            _retain_mesh_refs(m, "dp_mesh", dp_mesh)
         if dp_config.name in (DataParallelType.fsdp, DataParallelType.hsdp):
             for m in model_parts:
                 if m.is_moe:
