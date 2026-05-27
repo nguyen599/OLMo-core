@@ -4,6 +4,8 @@ from typing import List, Optional, TypeVar, cast
 import torch
 from torch.distributed import DeviceMesh
 import torch.distributed.distributed_c10d as c10d
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.parallel.style import PrepareModuleInput
 
 from olmo_core.distributed.parallel import (
     DataParallelType,
@@ -30,6 +32,28 @@ log = logging.getLogger(__name__)
 
 
 M = TypeVar("M", Transformer, List[Transformer])
+
+
+def _mesh_group_names(mesh: DeviceMesh) -> tuple[str, ...]:
+    return tuple(str(name) for name in getattr(mesh, "_dim_group_names", ()))
+
+
+def _patch_prepare_module_input_for_pipeline_tp() -> None:
+    """Re-wrap DTensor inputs that arrive from a different PP stage's TP mesh."""
+    if getattr(PrepareModuleInput, "_olmo_core_pp_tp_patch", False):
+        return
+
+    original_prepare_input_arg = PrepareModuleInput._prepare_input_arg
+
+    def patched_prepare_input_arg(self, input, mesh, input_layout, desired_layout):
+        if input_layout is not None and isinstance(input, DTensor):
+            input_mesh = input.device_mesh
+            if _mesh_group_names(input_mesh) != _mesh_group_names(mesh):
+                input = input.to_local()
+        return original_prepare_input_arg(self, input, mesh, input_layout, desired_layout)
+
+    PrepareModuleInput._prepare_input_arg = patched_prepare_input_arg
+    PrepareModuleInput._olmo_core_pp_tp_patch = True
 
 
 def _retain_process_group_ref(refs: list, name: str, group: object) -> None:
@@ -95,6 +119,7 @@ def parallelize_model(
     ac_config: Optional[TransformerActivationCheckpointingConfig] = None,
     pp_enabled: bool = False,
 ) -> M:
+    _patch_prepare_module_input_for_pipeline_tp()
     model_parts: List[Transformer] = [model] if isinstance(model, Transformer) else model
 
     pp_mesh: Optional[DeviceMesh] = None
