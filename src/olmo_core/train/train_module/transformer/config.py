@@ -5,9 +5,16 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 import torch.distributed.checkpoint.state_dict as dist_cp_sd
+import torch.distributed as dist
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.pipelining import PipelineStage
+from torch.distributed.pipelining.stage import (
+    _normalize_model_output_as_tuple,
+    flatten_args,
+    map_debug_info,
+)
+from torch.utils._pytree import tree_map_only
 
 from olmo_core.config import Config, DType
 from olmo_core.distributed.parallel import (
@@ -42,9 +49,7 @@ log = logging.getLogger(__name__)
 
 
 def _to_local_tensor(x: Any) -> Any:
-    if isinstance(x, DTensor):
-        return x.to_local()
-    return x
+    return tree_map_only(DTensor, lambda t: t.to_local(), x)
 
 
 class LocalTensorPipelineStage(PipelineStage):
@@ -60,18 +65,139 @@ class LocalTensorPipelineStage(PipelineStage):
         kwargs: Optional[Dict[str, Any]] = None,
         save_forward_output: bool = True,
     ):
-        output = super().forward_one_chunk(
-            fwd_chunk_id,
-            args,
-            kwargs=kwargs,
-            save_forward_output=save_forward_output,
-        )
-        output_tuple, input_values = self.fwd_cache[fwd_chunk_id]
+        if self.is_first:
+            composite_args = args
+        else:
+            composite_args = self._retrieve_recv_activations(fwd_chunk_id)
+
+        composite_kwargs = kwargs or {}
+        self._validate_fwd_input(args, kwargs)
+
+        try:
+            output = self.forward_maybe_with_nosync(*composite_args, **composite_kwargs)
+        except Exception as e:
+            exc_msg = f"""
+            {self.log_prefix} failed to run forward:
+            args: {map_debug_info(composite_args)}
+            kwargs: {map_debug_info(composite_kwargs)}
+            """
+            raise RuntimeError(exc_msg) from e
+
+        output_tuple = _normalize_model_output_as_tuple(output)
+        local_output_tuple = tuple(_to_local_tensor(out) for out in output_tuple)
+
+        if self.is_last and save_forward_output:
+            self.output_chunks.append(output)
+
+        flat_args = flatten_args(composite_args)
+        flat_kwargs = flatten_args(composite_kwargs)
         self.fwd_cache[fwd_chunk_id] = (
-            tuple(_to_local_tensor(out) for out in output_tuple),
-            input_values,
+            local_output_tuple,
+            flat_args + flat_kwargs,
         )
+
+        log.debug(
+            "%s Forwarded chunk %s, outputs: %s",
+            self.log_prefix,
+            fwd_chunk_id,
+            map_debug_info(local_output_tuple),
+        )
+        self._validate_fwd_outputs(local_output_tuple)
         return output
+
+    def _shape_inference(
+        self,
+        args: tuple[Any, ...],
+        kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if kwargs is None:
+            kwargs = {}
+        if args is None:
+            raise AssertionError("Args may be an empty tuple but not None")
+
+        if (
+            self.is_first
+            or self.stage_index_to_group_rank[self.stage_index - 1] == self.group_rank
+        ):
+            log.debug(
+                "Shape inference: stage %s skipping recv, because shape info passed in via `args`",
+                self.stage_index,
+            )
+            args = tree_map_only(torch.Tensor, lambda x: x.to("meta"), args)
+        else:
+            if len(args) != 0:
+                raise AssertionError(
+                    "Can't supply input args for shape inference on non-first stage"
+                )
+            objects = [None]
+            log.debug(
+                "Shape inference: stage %s receiving from stage %s",
+                self.stage_index,
+                self.stage_index - 1,
+            )
+            dist.recv_object_list(
+                objects,
+                src=dist.get_global_rank(
+                    self.group or dist.distributed_c10d._get_default_group(),
+                    self.stage_index_to_group_rank[self.stage_index - 1],
+                ),
+                group=self.group,
+                device=self.device,
+                use_batch=True,
+            )
+            recv_args = objects[0]
+            if not isinstance(recv_args, tuple):
+                raise AssertionError(f"Expected tuple, got {type(recv_args)}")
+            args = recv_args
+
+        self.inputs_meta = args
+        args = tree_map_only(
+            torch.Tensor, lambda x: torch.zeros_like(x, device=self.device), args
+        )
+
+        with torch.no_grad():
+            outputs = self.submod(*args, **kwargs)
+
+        outputs_tuple = _normalize_model_output_as_tuple(outputs)
+        local_outputs = tuple(_to_local_tensor(out) for out in outputs_tuple)
+        outputs_meta = tuple(
+            tree_map_only(torch.Tensor, lambda x: x.to("meta"), local_outputs)
+        )
+        log.debug(
+            "Shape inference: stage %s inputs %s, outputs %s",
+            self.stage_index,
+            self.inputs_meta,
+            outputs_meta,
+        )
+        self._configure_outputs_meta(outputs_meta)
+
+        if (
+            self.is_last
+            or self.stage_index_to_group_rank[self.stage_index + 1] == self.group_rank
+        ):
+            log.debug(
+                "Shape inference: stage %s skipping send to next stage",
+                self.stage_index,
+            )
+        else:
+            log.debug(
+                "Shape inference: stage %s sending to stage %s",
+                self.stage_index,
+                self.stage_index + 1,
+            )
+            dist.send_object_list(
+                [outputs_meta],
+                dst=dist.get_global_rank(
+                    self.group or dist.distributed_c10d._get_default_group(),
+                    self.stage_index_to_group_rank[self.stage_index + 1],
+                ),
+                group=self.group,
+                device=self.device,
+                use_batch=True,
+            )
+            outputs_meta = tuple()
+
+        return outputs_meta
 
     def get_bwd_send_ops(self, bwd_chunk_id: int):
         if bwd_chunk_id in self.bwd_cache:
