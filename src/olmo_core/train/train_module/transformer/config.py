@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 import torch
 import torch.distributed.checkpoint.state_dict as dist_cp_sd
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torch.distributed.pipelining import PipelineStage
 
 from olmo_core.config import Config, DType
@@ -38,6 +39,46 @@ if TYPE_CHECKING:
     from .train_module import TransformerTrainModule
 
 log = logging.getLogger(__name__)
+
+
+def _to_local_tensor(x: Any) -> Any:
+    if isinstance(x, DTensor):
+        return x.to_local()
+    return x
+
+
+class LocalTensorPipelineStage(PipelineStage):
+    """
+    Keep pipeline-bound activations local because c10d P2P collectives cannot send DTensors.
+    Downstream TP hooks re-wrap local tensors on the receiving stage's TP mesh.
+    """
+
+    def forward_one_chunk(
+        self,
+        fwd_chunk_id: int,
+        args: tuple[Any, ...],
+        kwargs: Optional[Dict[str, Any]] = None,
+        save_forward_output: bool = True,
+    ):
+        output = super().forward_one_chunk(
+            fwd_chunk_id,
+            args,
+            kwargs=kwargs,
+            save_forward_output=save_forward_output,
+        )
+        output_tuple, input_values = self.fwd_cache[fwd_chunk_id]
+        self.fwd_cache[fwd_chunk_id] = (
+            tuple(_to_local_tensor(out) for out in output_tuple),
+            input_values,
+        )
+        return output
+
+    def get_bwd_send_ops(self, bwd_chunk_id: int):
+        if bwd_chunk_id in self.bwd_cache:
+            self.bwd_cache[bwd_chunk_id] = tuple(
+                _to_local_tensor(grad) for grad in self.bwd_cache[bwd_chunk_id]
+            )
+        return super().get_bwd_send_ops(bwd_chunk_id)
 
 
 @beta_feature
@@ -119,7 +160,7 @@ class TransformerPipelineParallelConfig(PipelineParallelConfig):
             if not is_last:
                 model_chunk.lm_head = None  # type: ignore
 
-            stage = PipelineStage(
+            stage = LocalTensorPipelineStage(
                 model_chunk,
                 stage_idx,
                 num_stages,
