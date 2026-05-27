@@ -783,7 +783,9 @@ class Transformer(nn.Module):
             block = cast(TransformerBlockBase, block)
             block.apply_compile()
 
-        if self.lm_head is not None:
+        # Pipeline shape inference calls the final stage with DTensor metadata;
+        # compiling the LM head there can hit Inductor SymInt hashing failures.
+        if self.lm_head is not None and not self.pp_enabled:
             self.lm_head.compile(fullgraph=False)
 
         torch.compiler.config.dynamic_sources += "L['kwargs']['max_doc_len'],"
