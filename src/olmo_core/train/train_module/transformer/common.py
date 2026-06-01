@@ -27,6 +27,7 @@ from .config import (
     TransformerExpertParallelConfig,
     TransformerTensorParallelConfig,
 )
+from olmo_core.pp_patch_flags import pp_fixes_enabled
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ def _mesh_group_names(mesh: DeviceMesh) -> tuple[str, ...]:
 
 def _patch_prepare_module_input_for_pipeline_tp() -> None:
     """Re-wrap DTensor inputs that arrive from a different PP stage's TP mesh."""
+    if not pp_fixes_enabled():
+        return
     if getattr(PrepareModuleInput, "_olmo_core_pp_tp_patch", False):
         return
 
@@ -74,6 +77,11 @@ def _retain_mesh_refs(module: object, name: str, mesh: DeviceMesh) -> None:
         refs = []
         setattr(module, "_olmo_core_parallel_refs", refs)
     refs.append((name, mesh))
+
+    if not pp_fixes_enabled():
+        if mesh.ndim == 1:
+            refs.append((f"{name}_group", mesh.get_group()))
+        return
 
     candidate_meshes = [mesh]
     try:

@@ -15,6 +15,7 @@ from torch.distributed.pipelining.schedules import (
 
 from olmo_core.config import Config, StrEnum
 from olmo_core.exceptions import OLMoConfigurationError
+from olmo_core.pp_patch_flags import pp_fixes_enabled
 
 
 class PipelineSplitStyle(StrEnum):
@@ -217,6 +218,6 @@ class PipelineSchedule:
         else:
             target = None
 
-        stage_args = args if self.has_first_stage else ()
+        stage_args = args if self.has_first_stage or not pp_fixes_enabled() else ()
         output = self.base_schedule.step(*stage_args, target=target, losses=losses, **kwargs)
         return output, None if losses is None else torch.stack(losses)

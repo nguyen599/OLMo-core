@@ -41,6 +41,7 @@ from olmo_core.nn.lm_head import LMOutputWithLoss
 from olmo_core.nn.transformer import Transformer
 from olmo_core.optim import OptimConfig, SkipStepOptimizer
 from olmo_core.optim.scheduler import Scheduler
+from olmo_core.pp_patch_flags import pp_fixes_enabled
 from olmo_core.utils import (
     gc_cuda,
     get_default_device,
@@ -151,8 +152,9 @@ class TransformerPipelineTrainModule(TrainModule):
         self._pp_stages: Optional[List[PipelineStage]] = None
         self.pp_mesh = get_pp_mesh(self.world_mesh)
         self.pp_group = self.pp_mesh.get_group()
-        _retain_mesh_refs(self, "world_mesh", self.world_mesh)
-        _retain_mesh_refs(self, "pp_mesh", self.pp_mesh)
+        if pp_fixes_enabled():
+            _retain_mesh_refs(self, "world_mesh", self.world_mesh)
+            _retain_mesh_refs(self, "pp_mesh", self.pp_mesh)
         self.pp_group_rank = get_rank(self.pp_group)
         self.pp_group_size = get_world_size(self.pp_group)
         self.pp_prev_rank = (self.pp_group_rank - 1) % self.pp_group_size
@@ -269,7 +271,8 @@ class TransformerPipelineTrainModule(TrainModule):
         assert self._pp_stages is not None
         pp_mesh = get_pp_mesh(self.world_mesh)
         assert pp_mesh is not None
-        _retain_mesh_refs(self, "train_pp_mesh", pp_mesh)
+        if pp_fixes_enabled():
+            _retain_mesh_refs(self, "train_pp_mesh", pp_mesh)
 
         # Determine the number of micro-batches.
         rank_batch_size = self.trainer.global_batch_size // dp_ws

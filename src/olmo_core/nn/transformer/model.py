@@ -35,6 +35,7 @@ from olmo_core.nn.attention.ring import (
     RingContextParallelStyle,
     UlyssesContextParallelStyle,
 )
+from olmo_core.pp_patch_flags import pp_fixes_enabled
 from olmo_core.utils import get_default_device, mark_dynamic, move_to_device
 
 from ..attention import (
@@ -785,7 +786,7 @@ class Transformer(nn.Module):
 
         # Pipeline shape inference calls the final stage with DTensor metadata;
         # compiling the LM head there can hit Inductor SymInt hashing failures.
-        if self.lm_head is not None and not self.pp_enabled:
+        if self.lm_head is not None and (not self.pp_enabled or not pp_fixes_enabled()):
             self.lm_head.compile(fullgraph=False)
 
         torch.compiler.config.dynamic_sources += "L['kwargs']['max_doc_len'],"

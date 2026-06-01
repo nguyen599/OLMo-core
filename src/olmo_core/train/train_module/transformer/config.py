@@ -41,6 +41,8 @@ from olmo_core.optim import OptimConfig
 from olmo_core.optim.scheduler import Scheduler
 from olmo_core.train.train_module.config import TrainModuleConfig
 
+from olmo_core.pp_patch_flags import pp_fixes_enabled
+
 if TYPE_CHECKING:
     from .pipeline_train_module import TransformerPipelineTrainModule
     from .train_module import TransformerTrainModule
@@ -286,7 +288,8 @@ class TransformerPipelineParallelConfig(PipelineParallelConfig):
             if not is_last:
                 model_chunk.lm_head = None  # type: ignore
 
-            stage = LocalTensorPipelineStage(
+            stage_cls = LocalTensorPipelineStage if pp_fixes_enabled() else PipelineStage
+            stage = stage_cls(
                 model_chunk,
                 stage_idx,
                 num_stages,
