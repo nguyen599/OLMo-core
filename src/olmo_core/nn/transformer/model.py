@@ -747,7 +747,7 @@ class Transformer(nn.Module):
                 log.info(f"Wrapped '{name}' for activation checkpointing")
                 wrapped_modules.add(name)
         else:
-            for block_idx, block in enumerate(self.blocks.values()):
+            for block_idx, (block_name, block) in enumerate(list(self.blocks.items())):
                 if mode == TransformerActivationCheckpointingMode.selected_blocks:
                     assert block_interval is not None
                     if block_idx % block_interval == 0:
@@ -769,7 +769,7 @@ class Transformer(nn.Module):
                         preserve_rng_state=preserve_rng_state,
                     )
 
-                self.blocks.register_module(str(block_idx), block)
+                self.blocks.register_module(block_name, block)
 
     def apply_compile(self):
         """
