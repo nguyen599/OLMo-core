@@ -1,7 +1,9 @@
 import pytest
+import torch
 
 import olmo_core.nn.attention.flash_attn_api as flash_attn_api
 from olmo_core.nn.attention.flash_attn_api import (
+    dispatch_flash_attn_4,
     has_flash_attn_4,
     is_flash_attn_4_compute_capability_supported,
 )
@@ -38,3 +40,54 @@ def test_has_flash_attn_4_allows_sm90_plus_when_module_is_available(monkeypatch,
     monkeypatch.setattr(flash_attn_api.torch.cuda, "get_device_capability", lambda: compute_capability)
 
     assert has_flash_attn_4() is expected
+
+
+def test_dispatch_flash_attn_4_varlen_uses_keyword_arguments(monkeypatch):
+    captured = {}
+
+    class FakeFlashAttn4:
+        @staticmethod
+        def flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            qv=None,
+            *,
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            max_seqlen_q=None,
+            max_seqlen_k=None,
+            **kwargs,
+        ):
+            captured.update(
+                qv=qv,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                kwargs=kwargs,
+            )
+            return torch.empty_like(q), None
+
+    monkeypatch.setattr(flash_attn_api, "flash_attn_4", FakeFlashAttn4)
+    q = torch.randn(1, 4, 2, 8)
+    k = torch.randn(1, 4, 2, 8)
+    v = torch.randn(1, 4, 2, 8)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+
+    out = dispatch_flash_attn_4(
+        q,
+        k,
+        v,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=4,
+        causal=True,
+    )
+
+    assert out.shape == (4, 2, 8)
+    assert captured["qv"] is None
+    assert captured["cu_seqlens_q"] is cu_seqlens
+    assert captured["cu_seqlens_k"] is cu_seqlens
+    assert captured["max_seqlen_q"] == 4
+    assert captured["max_seqlen_k"] == 4
+    assert captured["kwargs"]["causal"] is True
