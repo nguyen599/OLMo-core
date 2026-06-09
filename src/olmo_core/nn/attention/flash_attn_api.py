@@ -48,14 +48,17 @@ def has_flash_attn_3() -> bool:
     return False
 
 
+def is_flash_attn_4_compute_capability_supported(compute_capability: Tuple[int, int]) -> bool:
+    # Mirrors flash_attn/cute/interface.py, which accepts arch / 10 in [9, 10, 11].
+    major, _ = compute_capability
+    return major in (9, 10, 11)
+
+
 def has_flash_attn_4() -> bool:
     if flash_attn_4 is not None:
         if torch.cuda.is_available():
             compute_capability = torch.cuda.get_device_capability()
-            return compute_capability >= (10, 0) and compute_capability <= (
-                12,
-                0,
-            )  # Blackwell, Blackwell Ultra
+            return is_flash_attn_4_compute_capability_supported(compute_capability)
         return True
     return False
 

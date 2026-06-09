@@ -65,7 +65,7 @@ class AttentionBackendName(StrEnum):
     flash_4 = "flash_4"
     """
     Flash attention 4, the CUTE implementation from `flash-attn <https://github.com/Dao-AILab/flash-attention>`_
-    in the ``flash_attn/cute`` subdirectory. Supports Blackwell (SM 10.0, e.g. B200) GPUs only.
+    in the ``flash_attn/cute`` subdirectory. Supports SM 9.x through 11.x GPUs.
     ➡️ :class:`FlashAttention4Backend`
     """
     te = "te"
