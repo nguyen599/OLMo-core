@@ -661,6 +661,7 @@ class Attention(SequenceMixer):
         use_local_output: bool = True,
         float8_enabled: bool = False,
     ):
+        self.backend.apply_tp(tp_mesh)
         rowwise_parallel, colwise_parallel, prepare_module_input = get_tp_wrappers(
             float8_enabled=float8_enabled
         )

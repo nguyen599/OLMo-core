@@ -248,6 +248,10 @@ class AttentionBackend(nn.Module):
         """
         del max_seq_len, device
 
+    def apply_tp(self, tp_mesh: DeviceMesh):
+        """Apply tensor-parallel metadata required by the attention backend."""
+        del tp_mesh
+
     @abstractmethod
     def forward(
         self,
@@ -1045,7 +1049,20 @@ class TEAttentionBackend(AttentionBackend):
         if not has_te_attn():
             raise RuntimeError("TransformerEngine attention is not available")
         assert TEDotProductAttention is not None
-        self.te_attn = TEDotProductAttention(
+        self.te_attn = self._build_te_attn()
+        # Transformer Engine exposes runtime metadata through ``_extra_state``.
+        # It is not a model weight and is absent from HF-converted checkpoints.
+        self.register_state_dict_post_hook(_strip_te_extra_state)
+        self.register_load_state_dict_pre_hook(_restore_te_extra_state_for_load)
+
+    def _build_te_attn(
+        self,
+        *,
+        tp_size: int = 1,
+        tp_group: Optional[dist.ProcessGroup] = None,
+    ) -> nn.Module:
+        assert TEDotProductAttention is not None
+        return TEDotProductAttention(
             self.n_heads,
             self.head_dim,
             num_gqa_groups=self.n_kv_heads,
@@ -1054,11 +1071,9 @@ class TEAttentionBackend(AttentionBackend):
             window_size=(self.window_size[0], 0),  # be explicit about causal mask
             qkv_format="bshd",
             softmax_scale=self.scale,
+            tp_size=tp_size,
+            tp_group=tp_group,
         )
-        # Transformer Engine exposes runtime metadata through ``_extra_state``.
-        # It is not a model weight and is absent from HF-converted checkpoints.
-        self.register_state_dict_post_hook(_strip_te_extra_state)
-        self.register_load_state_dict_pre_hook(_restore_te_extra_state_for_load)
 
     @classmethod
     def assert_supported(cls):
@@ -1091,6 +1106,33 @@ class TEAttentionBackend(AttentionBackend):
     def assert_supports_kv_cache(cls):
         raise RuntimeError(f"'{cls.__name__}' doesn't support KV caching")
 
+    def apply_tp(self, tp_mesh: DeviceMesh):
+        tp_group = tp_mesh.get_group()
+        self.te_attn = self._build_te_attn(tp_size=tp_mesh.size(), tp_group=tp_group)
+        if self.cp_enabled:
+            self._configure_context_parallel_group()
+
+    def _configure_context_parallel_group(self):
+        assert self.cp_pg is not None
+        if self.ring is not None:
+            if self.ring.load_balancer == RingAttentionLoadBalancerType.zig_zag:
+                cp_comm_type = "p2p"
+            elif self.ring.load_balancer == RingAttentionLoadBalancerType.llama3:
+                cp_comm_type = "all_gather"
+            else:
+                raise ValueError(self.ring.load_balancer)
+        elif self.uly is not None:
+            cp_comm_type = "a2a"
+        else:
+            raise ValueError("One of ring or uly must be specified")
+
+        self.te_attn.set_context_parallel_group(
+            cp_group=self.cp_pg,
+            cp_global_ranks=dist.get_process_group_ranks(self.cp_pg),
+            cp_stream=torch.cuda.default_stream(),
+            cp_comm_type=cp_comm_type,
+        )
+
     def apply_cp(
         self,
         cp_mesh: DeviceMesh,
@@ -1098,31 +1140,7 @@ class TEAttentionBackend(AttentionBackend):
         uly: Optional[UlyssesContextParallelStyle] = None,
     ):
         super().apply_cp(cp_mesh, ring=ring, uly=uly)
-        if self.ring is not None:
-            if self.ring.load_balancer == RingAttentionLoadBalancerType.zig_zag:
-                cp_comm_type = "p2p"  # Note: zig-zag/p2p is preferred bc it overlaps with the attention computation
-            elif self.ring.load_balancer == RingAttentionLoadBalancerType.llama3:
-                cp_comm_type = "all_gather"
-            else:
-                raise ValueError(self.ring.load_balancer)
-
-            self.te_attn.set_context_parallel_group(
-                cp_group=cp_mesh.get_group(),
-                cp_global_ranks=dist.get_process_group_ranks(cp_mesh.get_group()),
-                cp_stream=torch.cuda.default_stream(),
-                #  cp_stream=get_or_init_stream("cp"),  # this doesn't seem to help
-                cp_comm_type=cp_comm_type,
-            )
-        elif self.uly is not None:
-            self.te_attn.set_context_parallel_group(
-                cp_group=cp_mesh.get_group(),
-                cp_global_ranks=dist.get_process_group_ranks(cp_mesh.get_group()),
-                cp_stream=torch.cuda.default_stream(),
-                #  cp_stream=get_or_init_stream("cp"),  # this doesn't seem to help
-                cp_comm_type="a2a",
-            )
-        else:
-            raise ValueError("One of ring or uly must be specified")
+        self._configure_context_parallel_group()
 
     @torch.compiler.disable(
         reason="Transformer Engine attention uses Python/pybind setup that Dynamo should not trace"

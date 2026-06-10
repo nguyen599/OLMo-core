@@ -28,6 +28,18 @@ class FakeTEDotProductAttention(torch.nn.Module):
         self.loaded_extra_state = state
 
 
+class FakeDeviceMesh:
+    def __init__(self, size, group):
+        self._size = size
+        self._group = group
+
+    def size(self):
+        return self._size
+
+    def get_group(self):
+        return self._group
+
+
 def _build_te_backend(monkeypatch):
     monkeypatch.setattr(backend_mod, "has_te_attn", lambda: True)
     monkeypatch.setattr(backend_mod, "TEDotProductAttention", FakeTEDotProductAttention)
@@ -80,6 +92,16 @@ def test_te_backend_extra_state_is_checkpoint_neutral(monkeypatch):
     assert "te_attn._extra_state" not in state_dict
     attn.load_state_dict(state_dict, strict=True)
     assert attn.te_attn.loaded_extra_state == {"runtime_only": True}
+
+
+def test_te_backend_applies_tensor_parallel_group(monkeypatch):
+    attn = _build_te_backend(monkeypatch)
+    tp_group = object()
+
+    attn.apply_tp(FakeDeviceMesh(2, tp_group))
+
+    assert attn.te_attn.init_kwargs["tp_size"] == 2
+    assert attn.te_attn.init_kwargs["tp_group"] is tp_group
 
 
 def test_te_backend_extra_state_is_absent_from_distributed_state_dict(monkeypatch, tmp_path):
