@@ -10,8 +10,37 @@ from olmo_core.distributed.checkpoint import (
 )
 from olmo_core.distributed.utils import get_rank, get_world_size
 from olmo_core.nn.feed_forward import ActivationFunction, FeedForward
+from olmo_core.nn import feed_forward as feed_forward_mod
 from olmo_core.testing import BACKENDS, run_distributed_test
 from olmo_core.utils import get_default_device, record_flops, seed_all
+
+
+class FakeTELinear(torch.nn.Linear):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = True,
+        params_dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+        save_original_input: bool = False,
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias,
+            dtype=params_dtype,
+            device=device,
+        )
+        self.save_original_input = save_original_input
+        self.loaded_extra_state = None
+
+    def get_extra_state(self):
+        return {"runtime_only": True}
+
+    def set_extra_state(self, state):
+        self.loaded_extra_state = state
 
 
 def _run_tensor_parallel_feed_forward(
@@ -117,3 +146,34 @@ def test_feed_forward_activations(activation: ActivationFunction):
 
     y.sum().backward()
     assert ff.w1.weight.grad is not None
+
+
+def test_feed_forward_can_enable_te_linear(monkeypatch):
+    monkeypatch.setattr(feed_forward_mod, "_load_te_linear_cls", lambda: FakeTELinear)
+    seed_all(0)
+    ff = FeedForward(d_model=16, hidden_size=32, init_device="cpu", bias=False)
+    x = torch.randn(2, 8, 16)
+    expected = ff(x)
+
+    ff.enable_te_linear()
+    actual = ff(x)
+
+    assert isinstance(ff.w1, FakeTELinear)
+    assert isinstance(ff.w2, FakeTELinear)
+    assert isinstance(ff.w3, FakeTELinear)
+    assert ff.w1.save_original_input
+    torch.testing.assert_close(actual, expected)
+
+
+def test_feed_forward_te_linear_state_dict_is_checkpoint_compatible(monkeypatch):
+    monkeypatch.setattr(feed_forward_mod, "_load_te_linear_cls", lambda: FakeTELinear)
+    ff = FeedForward(d_model=16, hidden_size=32, init_device="cpu", bias=False)
+    ff.enable_te_linear()
+
+    state_dict = ff.state_dict()
+
+    assert "w1._extra_state" not in state_dict
+    assert "w2._extra_state" not in state_dict
+    assert "w3._extra_state" not in state_dict
+    ff.load_state_dict(state_dict, strict=True)
+    assert ff.w1.loaded_extra_state == {"runtime_only": True}

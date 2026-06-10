@@ -471,6 +471,7 @@ class TransformerTrainModuleConfig(TrainModuleConfig):
 
     compile_model: bool = False
     float8_config: Optional[Float8Config] = None
+    te_feed_forward: bool = False
     pp_config: Optional[TransformerPipelineParallelConfig] = None
     dp_config: Optional[TransformerDataParallelConfig] = None
     tp_config: Optional[TransformerTensorParallelConfig] = None

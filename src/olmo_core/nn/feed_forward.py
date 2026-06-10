@@ -1,7 +1,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Type
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,82 @@ __all__ = [
     "FeedForward",
     "NormalizedFeedForward",
 ]
+
+
+_TE_LINEAR_NAMES = ("w1", "w2", "w3")
+
+
+def _load_te_linear_cls() -> Optional[Type[nn.Module]]:
+    try:
+        from transformer_engine.pytorch import Linear as TELinear  # type: ignore
+    except Exception:
+        return None
+    return TELinear
+
+
+def _strip_te_linear_extra_state(
+    module: nn.Module,
+    state_dict: dict[str, object],
+    prefix: str,
+    local_metadata: dict[str, object],
+) -> None:
+    del module, local_metadata
+    for name in _TE_LINEAR_NAMES:
+        state_dict.pop(f"{prefix}{name}._extra_state", None)
+
+
+def _restore_te_linear_extra_state_for_load(
+    module: nn.Module,
+    state_dict: dict[str, object],
+    prefix: str,
+    local_metadata: dict[str, object],
+    strict: bool,
+    missing_keys: list[str],
+    unexpected_keys: list[str],
+    error_msgs: list[str],
+) -> None:
+    del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    for name in _TE_LINEAR_NAMES:
+        linear = getattr(module, name, None)
+        if linear is None:
+            continue
+        extra_state_key = f"{prefix}{name}._extra_state"
+        if extra_state_key in state_dict:
+            continue
+        if type(linear).get_extra_state is not nn.Module.get_extra_state:
+            state_dict[extra_state_key] = linear.get_extra_state()
+
+
+def _copy_linear_weights(src: nn.Module, dst: nn.Module) -> None:
+    src_weight = getattr(src, "weight")
+    dst_weight = getattr(dst, "weight")
+    if src_weight.device.type == "meta" or dst_weight.device.type == "meta":
+        return
+    with torch.no_grad():
+        dst_weight.copy_(src_weight)
+        src_bias = getattr(src, "bias", None)
+        dst_bias = getattr(dst, "bias", None)
+        if src_bias is not None and dst_bias is not None:
+            dst_bias.copy_(src_bias)
+
+
+def _build_te_linear_from_linear(linear: nn.Linear) -> nn.Module:
+    te_linear_cls = _load_te_linear_cls()
+    if te_linear_cls is None:
+        raise OLMoConfigurationError(
+            "Transformer Engine Linear is not available. Install transformer_engine or disable "
+            "TE feed-forward mode."
+        )
+    te_linear = te_linear_cls(
+        linear.in_features,
+        linear.out_features,
+        bias=linear.bias is not None,
+        params_dtype=linear.weight.dtype,
+        device=linear.weight.device,
+        save_original_input=True,
+    )
+    _copy_linear_weights(linear, te_linear)
+    return te_linear
 
 
 class ActivationFunction(StrEnum):
@@ -161,6 +237,24 @@ class FeedForward(nn.Module):
         self.w1 = nn.Linear(d_model, hidden_size, bias=bias, dtype=dtype, device=init_device)
         self.w2 = nn.Linear(hidden_size, d_model, bias=bias, dtype=dtype, device=init_device)
         self.w3 = nn.Linear(d_model, hidden_size, bias=bias, dtype=dtype, device=init_device)
+        self._te_linear_enabled = False
+
+    def enable_te_linear(self) -> None:
+        """
+        Replace the dense MLP projections with Transformer Engine Linear modules.
+
+        The parameter names remain ``w1.weight``, ``w2.weight``, and ``w3.weight``, so
+        existing non-TE checkpoints can still load. TE runtime extra state is omitted
+        from checkpoints to keep them compatible with the standard OLMo-core layout.
+        """
+        if self._te_linear_enabled:
+            return
+        self.w1 = _build_te_linear_from_linear(self.w1)  # type: ignore[assignment]
+        self.w2 = _build_te_linear_from_linear(self.w2)  # type: ignore[assignment]
+        self.w3 = _build_te_linear_from_linear(self.w3)  # type: ignore[assignment]
+        self.register_state_dict_post_hook(_strip_te_linear_extra_state)
+        self.register_load_state_dict_pre_hook(_restore_te_linear_extra_state_for_load)
+        self._te_linear_enabled = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -178,6 +272,12 @@ class FeedForward(nn.Module):
         use_local_output: bool = True,
         float8_enabled: bool = False,
     ):
+        if self._te_linear_enabled and tp_mesh.size() > 1:
+            raise OLMoConfigurationError(
+                "Transformer Engine feed-forward mode currently supports only TP=1. "
+                "TE Linear's internal TP uses local-shard parameters, while OLMo-core's "
+                "current checkpoint load path expects DTensor-sharded MLP weights."
+            )
         rowwise_parallel, colwise_parallel, prepare_module_input = get_tp_wrappers(
             float8_enabled=float8_enabled
         )

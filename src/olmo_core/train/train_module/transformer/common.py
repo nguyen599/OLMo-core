@@ -18,6 +18,7 @@ from olmo_core.distributed.parallel import (
 )
 from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.float8 import Float8Config
+from olmo_core.nn.feed_forward import FeedForward
 from olmo_core.nn.transformer import MoETransformer, Transformer
 
 from .config import (
@@ -120,6 +121,7 @@ def parallelize_model(
     rank_microbatch_size: Optional[int] = None,
     compile_model: bool = False,
     float8_config: Optional[Float8Config] = None,
+    te_feed_forward: bool = False,
     dp_config: Optional[TransformerDataParallelConfig] = None,
     tp_config: Optional[TransformerTensorParallelConfig] = None,
     cp_config: Optional[TransformerContextParallelConfig] = None,
@@ -138,6 +140,25 @@ def parallelize_model(
             _retain_mesh_refs(m, "world_mesh", world_mesh)
             _retain_mesh_refs(m, "pp_mesh", pp_mesh)
             m.apply_pp(pp_mesh)
+
+    if te_feed_forward:
+        if float8_config is not None and float8_config.enabled:
+            raise OLMoConfigurationError(
+                "Transformer Engine feed-forward mode cannot be combined with torchao Float8Linear."
+            )
+        if tp_config is not None and tp_config.degree > 1:
+            raise OLMoConfigurationError(
+                "Transformer Engine feed-forward mode currently supports only TP=1. "
+                "TE Linear's internal TP changes parameter shapes and is not yet compatible with "
+                "the current OLMo-core DTensor checkpoint load path."
+            )
+        swapped = 0
+        for m in model_parts:
+            for module in m.modules():
+                if isinstance(module, FeedForward):
+                    module.enable_te_linear()
+                    swapped += 1
+        log.info("Swapped %d feed-forward module(s) to Transformer Engine Linear", swapped)
 
     # Maybe apply FP8 training.
     if float8_config is not None and float8_config.enabled:
