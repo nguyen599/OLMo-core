@@ -40,6 +40,35 @@ from .ring import (
 from .te_attn_api import TEDotProductAttention, has_te_attn
 
 
+def _strip_te_extra_state(
+    module: nn.Module,
+    state_dict: dict[str, object],
+    prefix: str,
+    local_metadata: dict[str, object],
+) -> None:
+    del module, local_metadata
+    state_dict.pop(f"{prefix}te_attn._extra_state", None)
+
+
+def _restore_te_extra_state_for_load(
+    module: nn.Module,
+    state_dict: dict[str, object],
+    prefix: str,
+    local_metadata: dict[str, object],
+    strict: bool,
+    missing_keys: list[str],
+    unexpected_keys: list[str],
+    error_msgs: list[str],
+) -> None:
+    del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    extra_state_key = f"{prefix}te_attn._extra_state"
+    if extra_state_key in state_dict:
+        return
+    te_attn = getattr(module, "te_attn")
+    if type(te_attn).get_extra_state is not nn.Module.get_extra_state:
+        state_dict[extra_state_key] = te_attn.get_extra_state()
+
+
 class AttentionBackendName(StrEnum):
     """
     An enumeration of the different attention backends.
@@ -1026,6 +1055,10 @@ class TEAttentionBackend(AttentionBackend):
             qkv_format="bshd",
             softmax_scale=self.scale,
         )
+        # Transformer Engine exposes runtime metadata through ``_extra_state``.
+        # It is not a model weight and is absent from HF-converted checkpoints.
+        self.register_state_dict_post_hook(_strip_te_extra_state)
+        self.register_load_state_dict_pre_hook(_restore_te_extra_state_for_load)
 
     @classmethod
     def assert_supported(cls):
