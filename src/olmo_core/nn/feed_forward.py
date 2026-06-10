@@ -37,6 +37,51 @@ def _load_te_linear_cls() -> Optional[Type[nn.Module]]:
     return TELinear
 
 
+def _load_transformer_engine_torch() -> object | None:
+    try:
+        import transformer_engine_torch as tex  # type: ignore
+    except Exception:
+        return None
+    return tex
+
+
+class _TEGLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate: torch.Tensor, linear: torch.Tensor, activation):
+        tex = _load_transformer_engine_torch()
+        if tex is None:
+            raise OLMoConfigurationError(
+                "transformer_engine_torch is not available. Install Transformer Engine or disable "
+                "TE fused feed-forward activation mode."
+            )
+        glu_input = torch.cat((gate, linear), dim=-1).contiguous()
+        if activation == ActivationFunction.silu:
+            output = tex.swiglu(glu_input, None)
+        else:
+            raise OLMoConfigurationError(f"Unsupported TE fused feed-forward activation: {activation}")
+        ctx.save_for_backward(glu_input)
+        ctx.activation = activation
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        tex = _load_transformer_engine_torch()
+        if tex is None:
+            raise OLMoConfigurationError(
+                "transformer_engine_torch is not available during TE fused feed-forward backward."
+            )
+        (glu_input,) = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        if ctx.activation == ActivationFunction.silu:
+            grad_glu_input = tex.dswiglu(grad_output, glu_input, None)
+        else:
+            raise OLMoConfigurationError(
+                f"Unsupported TE fused feed-forward activation: {ctx.activation}"
+            )
+        gate_grad, linear_grad = grad_glu_input.chunk(2, dim=-1)
+        return gate_grad, linear_grad, None
+
+
 def _strip_te_linear_extra_state(
     module: nn.Module,
     state_dict: dict[str, object],
@@ -233,11 +278,13 @@ class FeedForward(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.hidden_size = hidden_size
+        self.activation = activation
         self.activation_fn = activation.build()
         self.w1 = nn.Linear(d_model, hidden_size, bias=bias, dtype=dtype, device=init_device)
         self.w2 = nn.Linear(hidden_size, d_model, bias=bias, dtype=dtype, device=init_device)
         self.w3 = nn.Linear(d_model, hidden_size, bias=bias, dtype=dtype, device=init_device)
         self._te_linear_enabled = False
+        self._te_glu_enabled = False
 
     def enable_te_linear(self) -> None:
         """
@@ -256,13 +303,45 @@ class FeedForward(nn.Module):
         self.register_load_state_dict_pre_hook(_restore_te_linear_extra_state_for_load)
         self._te_linear_enabled = True
 
+    def enable_te_glu(self) -> None:
+        """
+        Use Transformer Engine's fused GLU activation kernel for the MLP middle op.
+
+        This keeps the existing OLMo-core linear modules and therefore stays compatible
+        with DTensor TP sharding and checkpoint loading. It only replaces the local
+        ``activation(w1(x)) * w3(x)`` operation.
+        """
+        if self.__class__ is not FeedForward:
+            raise OLMoConfigurationError(
+                "TE fused feed-forward activation is only implemented for the default FeedForward."
+            )
+        if self._te_linear_enabled:
+            raise OLMoConfigurationError(
+                "TE fused feed-forward activation cannot be combined with TE Linear feed-forward mode."
+            )
+        if self.activation != ActivationFunction.silu:
+            raise OLMoConfigurationError(
+                f"TE fused feed-forward activation currently supports only {ActivationFunction.silu}; "
+                f"got {self.activation}."
+            )
+        if _load_transformer_engine_torch() is None:
+            raise OLMoConfigurationError(
+                "transformer_engine_torch is not available. Install Transformer Engine or disable "
+                "TE fused feed-forward activation mode."
+            )
+        self._te_glu_enabled = True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Run the feed-forward on the input ``x``.
 
         :param x: The input of shape ``(*, d_model)``.
         """
-        return self.w2(self.activation_fn(self.w1(x)) * self.w3(x))
+        gate = self.w1(x)
+        linear = self.w3(x)
+        if self._te_glu_enabled:
+            return self.w2(_TEGLUFunction.apply(gate, linear, self.activation))
+        return self.w2(self.activation_fn(gate) * linear)
 
     def apply_tp(
         self,

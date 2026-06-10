@@ -43,6 +43,25 @@ class FakeTELinear(torch.nn.Linear):
         self.loaded_extra_state = state
 
 
+class FakeTransformerEngineTorch:
+    @staticmethod
+    def swiglu(glu_input, quantizer):
+        del quantizer
+        gate, linear = glu_input.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * linear
+
+    @staticmethod
+    def dswiglu(grad_output, glu_input, quantizer):
+        del quantizer
+        gate, linear = glu_input.chunk(2, dim=-1)
+        sigmoid = torch.sigmoid(gate)
+        dsilu = sigmoid * (1 + gate * (1 - sigmoid))
+        return torch.cat(
+            (grad_output * linear * dsilu, grad_output * torch.nn.functional.silu(gate)),
+            dim=-1,
+        )
+
+
 def _run_tensor_parallel_feed_forward(
     checkpoint_dir: str, inputs_path: str, outputs_path: str, ff_kwargs: Dict[str, Any]
 ):
@@ -177,3 +196,29 @@ def test_feed_forward_te_linear_state_dict_is_checkpoint_compatible(monkeypatch)
     assert "w3._extra_state" not in state_dict
     ff.load_state_dict(state_dict, strict=True)
     assert ff.w1.loaded_extra_state == {"runtime_only": True}
+
+
+def test_feed_forward_can_enable_te_fused_glu(monkeypatch):
+    monkeypatch.setattr(
+        feed_forward_mod,
+        "_load_transformer_engine_torch",
+        lambda: FakeTransformerEngineTorch,
+    )
+    seed_all(0)
+    ff = FeedForward(d_model=16, hidden_size=32, init_device="cpu", bias=False)
+    te_ff = FeedForward(d_model=16, hidden_size=32, init_device="cpu", bias=False)
+    te_ff.load_state_dict(ff.state_dict())
+    te_ff.enable_te_glu()
+
+    x = torch.randn(2, 8, 16, requires_grad=True)
+    te_x = x.detach().clone().requires_grad_(True)
+
+    y = ff(x)
+    te_y = te_ff(te_x)
+    torch.testing.assert_close(te_y, y)
+
+    y.sum().backward()
+    te_y.sum().backward()
+    torch.testing.assert_close(te_x.grad, x.grad)
+    for name, param in ff.named_parameters():
+        torch.testing.assert_close(dict(te_ff.named_parameters())[name].grad, param.grad)

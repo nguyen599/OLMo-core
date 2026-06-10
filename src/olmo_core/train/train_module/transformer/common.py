@@ -122,6 +122,7 @@ def parallelize_model(
     compile_model: bool = False,
     float8_config: Optional[Float8Config] = None,
     te_feed_forward: bool = False,
+    te_feed_forward_glu: bool = False,
     dp_config: Optional[TransformerDataParallelConfig] = None,
     tp_config: Optional[TransformerTensorParallelConfig] = None,
     cp_config: Optional[TransformerContextParallelConfig] = None,
@@ -141,11 +142,18 @@ def parallelize_model(
             _retain_mesh_refs(m, "pp_mesh", pp_mesh)
             m.apply_pp(pp_mesh)
 
-    if te_feed_forward:
+    if te_feed_forward and te_feed_forward_glu:
+        raise OLMoConfigurationError(
+            "Transformer Engine feed-forward Linear mode and fused GLU mode are mutually exclusive."
+        )
+
+    if te_feed_forward or te_feed_forward_glu:
         if float8_config is not None and float8_config.enabled:
             raise OLMoConfigurationError(
-                "Transformer Engine feed-forward mode cannot be combined with torchao Float8Linear."
+                "Transformer Engine feed-forward modes cannot be combined with torchao Float8Linear."
             )
+
+    if te_feed_forward:
         if tp_config is not None and tp_config.degree > 1:
             raise OLMoConfigurationError(
                 "Transformer Engine feed-forward mode currently supports only TP=1. "
@@ -159,6 +167,18 @@ def parallelize_model(
                     module.enable_te_linear()
                     swapped += 1
         log.info("Swapped %d feed-forward module(s) to Transformer Engine Linear", swapped)
+
+    if te_feed_forward_glu:
+        swapped = 0
+        for m in model_parts:
+            for module in m.modules():
+                if type(module) is FeedForward:
+                    module.enable_te_glu()
+                    swapped += 1
+        log.info(
+            "Enabled Transformer Engine fused GLU activation for %d feed-forward module(s)",
+            swapped,
+        )
 
     # Maybe apply FP8 training.
     if float8_config is not None and float8_config.enabled:
