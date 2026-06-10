@@ -1043,6 +1043,14 @@ class TEAttentionBackend(AttentionBackend):
         pass
 
     @classmethod
+    def assert_supports_ring_cp(cls):
+        pass
+
+    @classmethod
+    def assert_supports_ulysses_cp(cls):
+        pass
+
+    @classmethod
     def assert_supports_packed_qkv(cls):
         raise RuntimeError(f"'{cls.__name__}' doesn't support packed QKV")
 
@@ -1106,30 +1114,46 @@ class TEAttentionBackend(AttentionBackend):
         if isinstance(qkv, torch.Tensor):
             raise RuntimeError(f"'{self.__class__.__name__}' doesn't support packed QKV")
 
-        if any(
-            opt is not None
-            for opt in (
-                cu_doc_lens,
-                cu_doc_lens_q,
-                cu_doc_lens_k,
-                max_doc_len,
-                max_doc_len_q,
-                max_doc_len_k,
-            )
-        ):
-            raise RuntimeError(
-                f"'{self.__class__.__name__}' doesn't currently support intra-document masking"
-            )
-
         q, k, v = qkv
+        cu_seqlens_q = cu_doc_lens if cu_doc_lens is not None else cu_doc_lens_q
+        cu_seqlens_kv = cu_doc_lens if cu_doc_lens is not None else cu_doc_lens_k
+        max_seqlen_q = max_doc_len if max_doc_len is not None else max_doc_len_q
+        max_seqlen_kv = max_doc_len if max_doc_len is not None else max_doc_len_k
+
+        if cu_seqlens_q is not None or cu_seqlens_kv is not None:
+            if cu_seqlens_q is None or cu_seqlens_kv is None:
+                raise RuntimeError(
+                    f"'{self.__class__.__name__}' requires both query and key/value cumulative "
+                    "sequence lengths for packed document masking"
+                )
+
+            output_shape = q.shape
+            q = q.reshape(-1, q.shape[-2], q.shape[-1])
+            k = k.reshape(-1, k.shape[-2], k.shape[-1])
+            v = v.reshape(-1, v.shape[-2], v.shape[-1])
+            out = self.te_attn(
+                q,
+                k,
+                v,
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                cu_seqlens_q_padded=cu_seqlens_q,
+                cu_seqlens_kv_padded=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                attn_mask_type="padding_causal",
+            )
+            return out.reshape(output_shape)
+
         return self.te_attn(
             q,
             k,
             v,
-            cu_seqlens_q=cu_doc_lens if cu_doc_lens is not None else cu_doc_lens_q,
-            cu_seqlens_kv=cu_doc_lens if cu_doc_lens is not None else cu_doc_lens_k,
-            max_seqlen_q=max_doc_len if max_doc_len is not None else max_doc_len_q,
-            max_seqlen_kv=max_doc_len if max_doc_len is not None else max_doc_len_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
         )
 
 
