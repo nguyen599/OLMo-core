@@ -19,6 +19,7 @@ from olmo_core.distributed.parallel import (
 from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.float8 import Float8Config
 from olmo_core.nn.feed_forward import FeedForward
+from olmo_core.nn.layer_norm import RMSNorm
 from olmo_core.nn.transformer import MoETransformer, Transformer
 
 from .config import (
@@ -123,6 +124,7 @@ def parallelize_model(
     float8_config: Optional[Float8Config] = None,
     te_feed_forward: bool = False,
     te_feed_forward_glu: bool = False,
+    te_layer_norm: bool = False,
     feed_forward_chunk_size_tokens: int = 0,
     dp_config: Optional[TransformerDataParallelConfig] = None,
     tp_config: Optional[TransformerTensorParallelConfig] = None,
@@ -153,6 +155,15 @@ def parallelize_model(
             raise OLMoConfigurationError(
                 "Transformer Engine feed-forward modes cannot be combined with torchao Float8Linear."
             )
+
+    if te_layer_norm:
+        swapped = 0
+        for m in model_parts:
+            for module in m.modules():
+                if isinstance(module, RMSNorm):
+                    module.enable_te_rms_norm()
+                    swapped += 1
+        log.info("Enabled Transformer Engine RMSNorm kernels for %d norm module(s)", swapped)
 
     if te_feed_forward:
         if tp_config is not None and tp_config.degree > 1:

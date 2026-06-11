@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from typing import Optional
 
 import torch
@@ -20,6 +21,69 @@ __all__ = [
     "FusedRMSNorm",
     "L2Norm",
 ]
+
+
+def _load_transformer_engine_norm_kernels() -> tuple[object, dict[torch.dtype, object]] | None:
+    try:
+        import transformer_engine_torch as tex  # type: ignore
+        from transformer_engine.pytorch.constants import TE_DType  # type: ignore
+    except Exception:
+        return None
+    return tex, TE_DType
+
+
+class _TERMSNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float, full_precision: bool):
+        loaded = _load_transformer_engine_norm_kernels()
+        if loaded is None:
+            raise OLMoConfigurationError(
+                "Transformer Engine RMSNorm kernels are not available. "
+                "Install Transformer Engine or disable TE layer norm mode."
+            )
+        tex, te_dtype = loaded
+        input_shape = x.shape
+        weight_shape = weight.shape
+        inner_dim = math.prod(weight_shape)
+        og_dtype = x.dtype
+        compute_dtype = torch.float32 if full_precision else x.dtype
+        x_compute = x.contiguous().to(compute_dtype).view((-1, inner_dim))
+        weight_compute = weight.to(compute_dtype).view((inner_dim,))
+        y, _, rstdevs = tex.rmsnorm_fwd(
+            x_compute,
+            weight_compute,
+            eps,
+            None,
+            None,
+            te_dtype[compute_dtype],
+            0,
+            False,
+        )
+        ctx.save_for_backward(x_compute, weight_compute, rstdevs)
+        ctx.input_shape = input_shape
+        ctx.weight_shape = weight_shape
+        ctx.input_dtype = og_dtype
+        ctx.weight_dtype = weight.dtype
+        ctx.compute_dtype = compute_dtype
+        return y.view(input_shape).to(og_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        loaded = _load_transformer_engine_norm_kernels()
+        if loaded is None:
+            raise OLMoConfigurationError(
+                "Transformer Engine RMSNorm kernels are not available during backward."
+            )
+        tex, _ = loaded
+        x, weight, rstdevs = ctx.saved_tensors
+        dy = grad_output.contiguous().to(ctx.compute_dtype).view(x.size())
+        dx, dw = tex.rmsnorm_bwd(dy, x, rstdevs, weight, 0, False)
+        return (
+            dx.view(ctx.input_shape).to(ctx.input_dtype),
+            dw.view(ctx.weight_shape).to(ctx.weight_dtype),
+            None,
+            None,
+        )
 
 
 class LayerNormType(StrEnum):
@@ -168,6 +232,7 @@ class LayerNorm(nn.Module):
         else:
             self.register_parameter("bias", None)
             self.register_parameter("weight", None)
+        self._te_rms_norm_enabled = False
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -212,12 +277,30 @@ class RMSNorm(LayerNorm):
     RMSNorm, a simplified layer norm implementation.
     """
 
+    def enable_te_rms_norm(self) -> None:
+        if self.weight is None:
+            raise OLMoConfigurationError(
+                "Transformer Engine RMSNorm requires elementwise_affine=True."
+            )
+        if self.bias is not None:
+            raise OLMoConfigurationError("Transformer Engine RMSNorm does not support bias.")
+        if _load_transformer_engine_norm_kernels() is None:
+            raise OLMoConfigurationError(
+                "Transformer Engine RMSNorm kernels are not available. "
+                "Install Transformer Engine or disable TE layer norm mode."
+            )
+        self._te_rms_norm_enabled = True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply RMSNorm.
 
         :param x: The input.
         """
+        if self._te_rms_norm_enabled:
+            assert self.weight is not None
+            return _TERMSNormFunction.apply(x, self.weight, self.eps, self.full_precision)
+
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype
 
@@ -244,6 +327,10 @@ class QwenRMSNorm(RMSNorm):
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._te_rms_norm_enabled:
+            assert self.weight is not None
+            return _TERMSNormFunction.apply(x, self.weight, self.eps, self.full_precision)
+
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype
 
