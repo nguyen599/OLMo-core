@@ -157,7 +157,10 @@ class LocalTensorPipelineStage(PipelineStage):
             torch.Tensor, lambda x: torch.zeros_like(x, device=self.device), args
         )
 
-        with torch.no_grad():
+        # Shape inference runs with synthetic meta-derived inputs. Letting compiled
+        # TP-sharded blocks trace this path can hit Dynamo/DTensor SymInt failures,
+        # while the real pipeline forward can still use the compiled blocks.
+        with torch.no_grad(), torch.compiler.set_stance("force_eager"):
             outputs = self.submod(*args, **kwargs)
 
         outputs_tuple = _normalize_model_output_as_tuple(outputs)
