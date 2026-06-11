@@ -63,12 +63,18 @@ class FakeTransformerEngineTorch:
 
 
 def _run_tensor_parallel_feed_forward(
-    checkpoint_dir: str, inputs_path: str, outputs_path: str, ff_kwargs: Dict[str, Any]
+    checkpoint_dir: str,
+    inputs_path: str,
+    outputs_path: str,
+    ff_kwargs: Dict[str, Any],
+    chunk_size_tokens: int = 0,
 ):
     device = get_default_device()
     mesh = init_device_mesh(device.type, (get_world_size(),), mesh_dim_names=("tp",))
 
     ff = FeedForward(init_device=device.type, **ff_kwargs)
+    if chunk_size_tokens > 0:
+        ff.enable_chunked_forward(chunk_size_tokens)
 
     ff.apply_tp(mesh["tp"], output_layout=Shard(1), use_local_output=False)
     load_model_and_optim_state(checkpoint_dir, ff)
@@ -222,3 +228,24 @@ def test_feed_forward_can_enable_te_fused_glu(monkeypatch):
     torch.testing.assert_close(te_x.grad, x.grad)
     for name, param in ff.named_parameters():
         torch.testing.assert_close(dict(te_ff.named_parameters())[name].grad, param.grad)
+
+
+def test_feed_forward_chunked_forward_matches_full_forward():
+    seed_all(0)
+    ff = FeedForward(d_model=16, hidden_size=32, init_device="cpu", bias=False)
+    chunked_ff = FeedForward(d_model=16, hidden_size=32, init_device="cpu", bias=False)
+    chunked_ff.load_state_dict(ff.state_dict())
+    chunked_ff.enable_chunked_forward(5)
+
+    x = torch.randn(3, 7, 16, requires_grad=True)
+    chunked_x = x.detach().clone().requires_grad_(True)
+
+    y = ff(x)
+    chunked_y = chunked_ff(chunked_x)
+    torch.testing.assert_close(chunked_y, y)
+
+    y.square().sum().backward()
+    chunked_y.square().sum().backward()
+    torch.testing.assert_close(chunked_x.grad, x.grad)
+    for name, param in ff.named_parameters():
+        torch.testing.assert_close(dict(chunked_ff.named_parameters())[name].grad, param.grad)

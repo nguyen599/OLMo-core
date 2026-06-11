@@ -473,6 +473,7 @@ class TransformerTrainModuleConfig(TrainModuleConfig):
     float8_config: Optional[Float8Config] = None
     te_feed_forward: bool = False
     te_feed_forward_glu: bool = False
+    feed_forward_chunk_size_tokens: int = 0
     pp_config: Optional[TransformerPipelineParallelConfig] = None
     dp_config: Optional[TransformerDataParallelConfig] = None
     tp_config: Optional[TransformerTensorParallelConfig] = None

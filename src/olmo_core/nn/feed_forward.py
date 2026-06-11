@@ -1,5 +1,7 @@
 import functools
 import math
+import os
+import logging
 from dataclasses import dataclass
 from typing import Callable, Optional, Type
 
@@ -7,8 +9,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import parallelize_module
-from torch.distributed.tensor.placement_types import Placement, Replicate
+from torch.distributed.tensor.placement_types import Placement, Replicate, Shard
 
 from ..config import DType, StrEnum
 from ..doc_utils import beta_feature
@@ -27,6 +30,60 @@ __all__ = [
 
 
 _TE_LINEAR_NAMES = ("w1", "w2", "w3")
+log = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _rank_allowed(spec: str, rank: str, local_rank: str) -> bool:
+    if spec.strip().lower() in {"", "all", "*"}:
+        return True
+    wanted = {part.strip() for part in spec.split(",") if part.strip()}
+    return rank in wanted or f"rank:{rank}" in wanted or f"local:{local_rank}" in wanted
+
+
+def _cuda_memory_summary() -> str:
+    if not torch.cuda.is_available():
+        return "cuda_available=False"
+    device = torch.cuda.current_device()
+    free, total = torch.cuda.mem_get_info(device)
+    active = torch.cuda.memory_allocated(device)
+    reserved = torch.cuda.memory_reserved(device)
+    peak_active = torch.cuda.max_memory_allocated(device)
+    gib = 1024**3
+    return (
+        f"device={device} active={active / gib:.2f}GiB reserved={reserved / gib:.2f}GiB "
+        f"peak_active={peak_active / gib:.2f}GiB free={free / gib:.2f}GiB total={total / gib:.2f}GiB"
+    )
+
+
+def _restore_chunked_dtensor_layout(
+    x: DTensor,
+    out: torch.Tensor | DTensor,
+    token_dim: int,
+) -> DTensor:
+    placements = tuple(x.placements)
+    shard_placement = next((placement for placement in placements if isinstance(placement, Shard)), None)
+    if shard_placement is None:
+        if isinstance(out, DTensor):
+            return out.redistribute(device_mesh=x.device_mesh, placements=placements)
+        return DTensor.from_local(out, x.device_mesh, placements, run_check=False)
+
+    local_out = out.to_local() if isinstance(out, DTensor) else out
+    local_x = x.to_local()
+    if local_out.shape[token_dim] != local_x.shape[token_dim]:
+        shard_dim = shard_placement.dim
+        shard_dim = shard_dim if shard_dim >= 0 else local_out.dim() + shard_dim
+        local_rank = x.device_mesh.get_local_rank()
+        local_size = local_x.shape[shard_dim]
+        start = local_rank * local_size
+        local_out = local_out.narrow(shard_dim, start, local_size).contiguous()
+    return DTensor.from_local(local_out, x.device_mesh, placements, run_check=False)
 
 
 def _load_te_linear_cls() -> Optional[Type[nn.Module]]:
@@ -285,6 +342,11 @@ class FeedForward(nn.Module):
         self.w3 = nn.Linear(d_model, hidden_size, bias=bias, dtype=dtype, device=init_device)
         self._te_linear_enabled = False
         self._te_glu_enabled = False
+        self._chunk_size_tokens = 0
+        self._memory_profile_name: str | None = None
+        self._memory_profile_calls = 0
+        self._tp_mesh: DeviceMesh | None = None
+        self._tp_output_layout: Placement | None = None
 
     def enable_te_linear(self) -> None:
         """
@@ -331,17 +393,111 @@ class FeedForward(nn.Module):
             )
         self._te_glu_enabled = True
 
+    def enable_chunked_forward(self, chunk_size_tokens: int) -> None:
+        """
+        Split the local token dimension during the feed-forward projection.
+
+        This reduces the peak memory from the two hidden-size intermediate tensors
+        in ``w1`` and ``w3`` at the cost of launching more GEMMs.
+        """
+        if chunk_size_tokens < 0:
+            raise OLMoConfigurationError("Feed-forward chunk size must be >= 0.")
+        if chunk_size_tokens > 0 and self._tp_mesh is not None and self._tp_mesh.size() > 1:
+            raise OLMoConfigurationError(
+                "Feed-forward token chunking is not currently safe with TP>1."
+            )
+        self._chunk_size_tokens = chunk_size_tokens
+
+    def set_memory_profile_name(self, name: str) -> None:
+        self._memory_profile_name = name
+
+    def _should_log_memory_profile(self) -> bool:
+        if not _env_flag("OLMO_FF_MEMORY_PROFILE"):
+            return False
+        rank = os.environ.get("RANK", os.environ.get("GLOBAL_RANK", "0"))
+        local_rank = os.environ.get("LOCAL_RANK", "0")
+        ranks = os.environ.get("OLMO_FF_MEMORY_PROFILE_RANKS", "all")
+        if not _rank_allowed(ranks, rank, local_rank):
+            return False
+        max_calls = int(os.environ.get("OLMO_FF_MEMORY_PROFILE_MAX_CALLS", "1"))
+        return max_calls <= 0 or self._memory_profile_calls < max_calls
+
+    def _log_memory_profile(self, point: str, x: torch.Tensor) -> None:
+        if not self._should_log_memory_profile():
+            return
+        if _env_flag("OLMO_FF_MEMORY_PROFILE_SYNC") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        rank = os.environ.get("RANK", os.environ.get("GLOBAL_RANK", "0"))
+        local_rank = os.environ.get("LOCAL_RANK", "0")
+        name = self._memory_profile_name or self.__class__.__name__
+        log.warning(
+            "FFN memory profile rank=%s local_rank=%s module=%s call=%d point=%s "
+            "shape=%s chunk_size_tokens=%d %s",
+            rank,
+            local_rank,
+            name,
+            self._memory_profile_calls,
+            point,
+            tuple(x.shape),
+            self._chunk_size_tokens,
+            _cuda_memory_summary(),
+        )
+
+    def _forward_unchecked(self, x: torch.Tensor) -> torch.Tensor:
+        self._log_memory_profile("before_w1", x)
+        gate = self.w1(x)
+        self._log_memory_profile("after_w1_before_w3", gate)
+        linear = self.w3(x)
+        self._log_memory_profile("after_w3_before_activation", linear)
+        if self._te_glu_enabled:
+            hidden = _TEGLUFunction.apply(gate, linear, self.activation)
+        else:
+            hidden = self.activation_fn(gate) * linear
+        self._log_memory_profile("after_activation_before_w2", hidden)
+        out = self.w2(hidden)
+        self._log_memory_profile("after_w2", out)
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Run the feed-forward on the input ``x``.
 
         :param x: The input of shape ``(*, d_model)``.
         """
-        gate = self.w1(x)
-        linear = self.w3(x)
-        if self._te_glu_enabled:
-            return self.w2(_TEGLUFunction.apply(gate, linear, self.activation))
-        return self.w2(self.activation_fn(gate) * linear)
+        chunk_size_tokens = self._chunk_size_tokens
+        if chunk_size_tokens <= 0 or x.numel() == 0:
+            try:
+                return self._forward_unchecked(x)
+            finally:
+                if self._should_log_memory_profile():
+                    self._memory_profile_calls += 1
+
+        token_dim = -2 if x.dim() > 2 else 0
+        if x.shape[token_dim] <= chunk_size_tokens:
+            try:
+                return self._forward_unchecked(x)
+            finally:
+                if self._should_log_memory_profile():
+                    self._memory_profile_calls += 1
+
+        outputs = []
+        try:
+            for chunk_idx, chunk in enumerate(x.split(chunk_size_tokens, dim=token_dim)):
+                self._log_memory_profile(f"chunk_{chunk_idx}_start", chunk)
+                outputs.append(self._forward_unchecked(chunk))
+                self._log_memory_profile(f"chunk_{chunk_idx}_end", outputs[-1])
+            out = torch.cat(outputs, dim=token_dim)
+            if isinstance(x, DTensor):
+                return _restore_chunked_dtensor_layout(x, out, token_dim)
+            if isinstance(out, DTensor) and self._tp_mesh is not None and self._tp_output_layout is not None:
+                out = out.redistribute(
+                    device_mesh=self._tp_mesh,
+                    placements=(self._tp_output_layout,),
+                )
+            return out
+        finally:
+            if self._should_log_memory_profile():
+                self._memory_profile_calls += 1
 
     def apply_tp(
         self,
@@ -357,6 +513,12 @@ class FeedForward(nn.Module):
                 "TE Linear's internal TP uses local-shard parameters, while OLMo-core's "
                 "current checkpoint load path expects DTensor-sharded MLP weights."
             )
+        if self._chunk_size_tokens > 0 and tp_mesh.size() > 1:
+            raise OLMoConfigurationError(
+                "Feed-forward token chunking is not currently safe with TP>1."
+            )
+        self._tp_mesh = tp_mesh
+        self._tp_output_layout = output_layout
         rowwise_parallel, colwise_parallel, prepare_module_input = get_tp_wrappers(
             float8_enabled=float8_enabled
         )

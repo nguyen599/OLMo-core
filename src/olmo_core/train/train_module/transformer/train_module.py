@@ -84,6 +84,7 @@ class TransformerTrainModule(TrainModule):
     :param float8_config: Float8 configuration for the model.
     :param te_feed_forward: Replace dense feed-forward linears with Transformer Engine Linear.
     :param te_feed_forward_glu: Use Transformer Engine fused GLU activation in feed-forward layers.
+    :param feed_forward_chunk_size_tokens: Token chunk size for feed-forward projections.
     :param dp_config: Data parallel configuration for the model.
     :param tp_config: Tensor parallel configuration for the model.
     :param cp_config: Context parallel configuration for the model.
@@ -111,6 +112,7 @@ class TransformerTrainModule(TrainModule):
         float8_config: Optional[Float8Config] = None,
         te_feed_forward: bool = False,
         te_feed_forward_glu: bool = False,
+        feed_forward_chunk_size_tokens: int = 0,
         dp_config: Optional[TransformerDataParallelConfig] = None,
         tp_config: Optional[TransformerTensorParallelConfig] = None,
         cp_config: Optional[TransformerContextParallelConfig] = None,
@@ -173,6 +175,7 @@ class TransformerTrainModule(TrainModule):
             float8_config=float8_config,
             te_feed_forward=te_feed_forward,
             te_feed_forward_glu=te_feed_forward_glu,
+            feed_forward_chunk_size_tokens=feed_forward_chunk_size_tokens,
             dp_config=dp_config,
             tp_config=tp_config,
             cp_config=cp_config,

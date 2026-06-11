@@ -123,6 +123,7 @@ def parallelize_model(
     float8_config: Optional[Float8Config] = None,
     te_feed_forward: bool = False,
     te_feed_forward_glu: bool = False,
+    feed_forward_chunk_size_tokens: int = 0,
     dp_config: Optional[TransformerDataParallelConfig] = None,
     tp_config: Optional[TransformerTensorParallelConfig] = None,
     cp_config: Optional[TransformerContextParallelConfig] = None,
@@ -170,15 +171,41 @@ def parallelize_model(
 
     if te_feed_forward_glu:
         swapped = 0
-        for m in model_parts:
-            for module in m.modules():
+        for part_idx, m in enumerate(model_parts):
+            for module_name, module in m.named_modules():
                 if type(module) is FeedForward:
+                    module.set_memory_profile_name(f"part{part_idx}.{module_name}")
                     module.enable_te_glu()
                     swapped += 1
         log.info(
             "Enabled Transformer Engine fused GLU activation for %d feed-forward module(s)",
             swapped,
         )
+
+    if feed_forward_chunk_size_tokens > 0:
+        if tp_config is not None and tp_config.degree > 1:
+            raise OLMoConfigurationError(
+                "Feed-forward token chunking is not currently safe with TP>1. "
+                "DTensor reconstruction passes forward shape checks but fails backward in local tests."
+            )
+        chunked = 0
+        for part_idx, m in enumerate(model_parts):
+            for module_name, module in m.named_modules():
+                if isinstance(module, FeedForward):
+                    module.set_memory_profile_name(f"part{part_idx}.{module_name}")
+                    module.enable_chunked_forward(feed_forward_chunk_size_tokens)
+                    chunked += 1
+        log.info(
+            "Enabled feed-forward token chunking for %d module(s), chunk_size_tokens=%d",
+            chunked,
+            feed_forward_chunk_size_tokens,
+        )
+
+    if feed_forward_chunk_size_tokens <= 0:
+        for part_idx, m in enumerate(model_parts):
+            for module_name, module in m.named_modules():
+                if isinstance(module, FeedForward):
+                    module.set_memory_profile_name(f"part{part_idx}.{module_name}")
 
     # Maybe apply FP8 training.
     if float8_config is not None and float8_config.enabled:
