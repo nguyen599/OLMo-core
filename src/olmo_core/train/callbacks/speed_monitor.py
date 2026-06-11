@@ -159,6 +159,14 @@ class SpeedMonitorCallback(Callback):
         step_time = counter - self._step_last_logged
         total_time = counter - self._start_time
         self._step_last_logged = counter
+        self.trainer.record_metric(
+            "throughput/device/step time (s)", step_time, reduce_type=ReduceType.max
+        )
+        self.trainer.record_metric(
+            "throughput/device/step time (actual avg s)",
+            total_time / self._total_steps,
+            reduce_type=ReduceType.max,
+        )
 
         if self._step_tokens and self._total_tokens:
             tps = self._step_tokens / step_time
