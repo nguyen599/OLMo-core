@@ -1,3 +1,4 @@
+import logging
 from abc import abstractmethod
 from typing import Optional, Tuple, Type, Union
 
@@ -38,6 +39,8 @@ from .ring import (
     UlyssesContextParallelStyle,
 )
 from .te_attn_api import TEDotProductAttention, has_te_attn
+
+log = logging.getLogger(__name__)
 
 
 def _strip_te_extra_state(
@@ -1049,6 +1052,10 @@ class TEAttentionBackend(AttentionBackend):
         if not has_te_attn():
             raise RuntimeError("TransformerEngine attention is not available")
         assert TEDotProductAttention is not None
+        self._te_tp_size = 1
+        self._te_tp_group: Optional[dist.ProcessGroup] = None
+        self._te_uses_local_shards = False
+        self._te_local_shard_log_emitted = False
         self.te_attn = self._build_te_attn()
         # Transformer Engine exposes runtime metadata through ``_extra_state``.
         # It is not a model weight and is absent from HF-converted checkpoints.
@@ -1060,12 +1067,14 @@ class TEAttentionBackend(AttentionBackend):
         *,
         tp_size: int = 1,
         tp_group: Optional[dist.ProcessGroup] = None,
+        n_heads: Optional[int] = None,
+        n_kv_heads: Optional[int] = None,
     ) -> nn.Module:
         assert TEDotProductAttention is not None
         return TEDotProductAttention(
-            self.n_heads,
+            n_heads if n_heads is not None else self.n_heads,
             self.head_dim,
-            num_gqa_groups=self.n_kv_heads,
+            num_gqa_groups=n_kv_heads if n_kv_heads is not None else self.n_kv_heads,
             attention_dropout=self.dropout_p,
             attn_mask_type="causal",
             window_size=(self.window_size[0], 0),  # be explicit about causal mask
@@ -1108,7 +1117,61 @@ class TEAttentionBackend(AttentionBackend):
 
     def apply_tp(self, tp_mesh: DeviceMesh):
         tp_group = tp_mesh.get_group()
+        self._te_tp_size = tp_mesh.size()
+        self._te_tp_group = tp_group
+        self._te_uses_local_shards = False
         self.te_attn = self._build_te_attn(tp_size=tp_mesh.size(), tp_group=tp_group)
+        if self.cp_enabled:
+            self._configure_context_parallel_group()
+
+    def _te_expected_heads(self) -> Tuple[Optional[int], Optional[int]]:
+        te_tp_size = getattr(self.te_attn, "tp_size", self._te_tp_size)
+        te_n_heads = getattr(self.te_attn, "num_attention_heads", None)
+        te_n_kv_heads = getattr(self.te_attn, "num_gqa_groups", None)
+        if isinstance(te_n_heads, int) and isinstance(te_tp_size, int) and te_tp_size > 0:
+            expected_q_heads = te_n_heads // te_tp_size
+        else:
+            expected_q_heads = None
+        if hasattr(self.te_attn, "num_gqa_groups_per_partition"):
+            expected_kv_heads = getattr(self.te_attn, "num_gqa_groups_per_partition")
+        elif isinstance(te_n_kv_heads, int) and isinstance(te_tp_size, int) and te_tp_size > 0:
+            expected_kv_heads = te_n_kv_heads // te_tp_size
+        else:
+            expected_kv_heads = None
+        return expected_q_heads, expected_kv_heads
+
+    def _ensure_te_matches_runtime_heads(self, q: torch.Tensor, k: torch.Tensor) -> None:
+        local_q_heads = q.shape[-2]
+        local_kv_heads = k.shape[-2]
+        expected_q_heads, expected_kv_heads = self._te_expected_heads()
+
+        q_matches = expected_q_heads is None or expected_q_heads == local_q_heads
+        kv_matches = expected_kv_heads is None or expected_kv_heads == local_kv_heads
+        if q_matches and kv_matches:
+            return
+
+        if not self._te_local_shard_log_emitted:
+            log.warning(
+                "Rebuilding TransformerEngine attention for local TP-sharded heads: "
+                "runtime_q_heads=%s runtime_kv_heads=%s expected_q_heads=%s expected_kv_heads=%s "
+                "configured_q_heads=%s configured_kv_heads=%s configured_tp_size=%s",
+                local_q_heads,
+                local_kv_heads,
+                expected_q_heads,
+                expected_kv_heads,
+                self.n_heads,
+                self.n_kv_heads,
+                self._te_tp_size,
+            )
+            self._te_local_shard_log_emitted = True
+
+        self._te_uses_local_shards = True
+        self.te_attn = self._build_te_attn(
+            tp_size=1,
+            tp_group=None,
+            n_heads=local_q_heads,
+            n_kv_heads=local_kv_heads,
+        )
         if self.cp_enabled:
             self._configure_context_parallel_group()
 
@@ -1166,6 +1229,7 @@ class TEAttentionBackend(AttentionBackend):
             raise RuntimeError(f"'{self.__class__.__name__}' doesn't support packed QKV")
 
         q, k, v = qkv
+        self._ensure_te_matches_runtime_heads(q, k)
         cu_seqlens_q = cu_doc_lens if cu_doc_lens is not None else cu_doc_lens_q
         cu_seqlens_kv = cu_doc_lens if cu_doc_lens is not None else cu_doc_lens_k
         max_seqlen_q = max_doc_len if max_doc_len is not None else max_doc_len_q

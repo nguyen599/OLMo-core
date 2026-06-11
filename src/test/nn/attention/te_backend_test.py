@@ -10,6 +10,10 @@ class FakeTEDotProductAttention(torch.nn.Module):
         super().__init__()
         self.init_args = args
         self.init_kwargs = kwargs
+        self.num_attention_heads = args[0]
+        self.tp_size = kwargs.get("tp_size", 1)
+        self.num_gqa_groups = kwargs.get("num_gqa_groups", args[0])
+        self.num_gqa_groups_per_partition = self.num_gqa_groups // self.tp_size
         self.calls = []
         self.loaded_extra_state = None
 
@@ -102,6 +106,39 @@ def test_te_backend_applies_tensor_parallel_group(monkeypatch):
 
     assert attn.te_attn.init_kwargs["tp_size"] == 2
     assert attn.te_attn.init_kwargs["tp_group"] is tp_group
+
+
+def test_te_backend_keeps_te_tensor_parallel_when_runtime_heads_match(monkeypatch):
+    attn = _build_te_backend(monkeypatch)
+    tp_group = object()
+    attn.apply_tp(FakeDeviceMesh(2, tp_group))
+    q = torch.randn(2, 3, 1, 4)
+    k = torch.randn(2, 3, 1, 4)
+    v = torch.randn(2, 3, 1, 4)
+
+    attn((q, k, v))
+
+    assert attn.te_attn.init_args[0] == 2
+    assert attn.te_attn.init_kwargs["num_gqa_groups"] == 2
+    assert attn.te_attn.init_kwargs["tp_size"] == 2
+    assert attn.te_attn.init_kwargs["tp_group"] is tp_group
+
+
+def test_te_backend_rebuilds_for_runtime_local_tp_heads(monkeypatch):
+    monkeypatch.setattr(backend_mod, "has_te_attn", lambda: True)
+    monkeypatch.setattr(backend_mod, "TEDotProductAttention", FakeTEDotProductAttention)
+    attn = backend_mod.TEAttentionBackend(head_dim=128, n_heads=40, n_kv_heads=8)
+    q = torch.randn(2, 3, 5, 128)
+    k = torch.randn(2, 3, 1, 128)
+    v = torch.randn(2, 3, 1, 128)
+
+    out = attn((q, k, v))
+
+    assert out.shape == q.shape
+    assert attn.te_attn.init_args[0] == 5
+    assert attn.te_attn.init_kwargs["num_gqa_groups"] == 1
+    assert attn.te_attn.init_kwargs["tp_size"] == 1
+    assert attn.te_attn.init_kwargs["tp_group"] is None
 
 
 def test_te_backend_extra_state_is_absent_from_distributed_state_dict(monkeypatch, tmp_path):
