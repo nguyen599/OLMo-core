@@ -1,6 +1,8 @@
 import pytest
 import torch
+from torch.distributed.tensor import DTensor, Shard, init_device_mesh
 
+from olmo_core.distributed.utils import get_rank, get_world_size
 from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.nn.layer_norm import (
     CuTeRMSNorm,
@@ -12,7 +14,8 @@ from olmo_core.nn.layer_norm import (
     RMSNorm,
 )
 from olmo_core.nn import layer_norm as layer_norm_mod
-from olmo_core.testing import requires_flash_attn_2, requires_gpu, requires_quack
+from olmo_core.testing import BACKENDS, requires_flash_attn_2, requires_gpu, requires_quack, run_distributed_test
+from olmo_core.utils import get_default_device, seed_all
 
 
 class FakeTENormKernels:
@@ -109,6 +112,59 @@ def test_te_rms_norm_rejects_bias(monkeypatch):
     norm = RMSNorm(size=64, bias=True, init_device="cpu")
     with pytest.raises(OLMoConfigurationError):
         norm.enable_te_rms_norm()
+
+
+def _run_dtensor_te_rms_norm(state_path, inputs_path, outputs_path):
+    layer_norm_mod._load_transformer_engine_norm_kernels = lambda: (
+        FakeTENormKernels,
+        {torch.float32: object(), torch.bfloat16: object()},
+    )
+    device = get_default_device()
+    mesh = init_device_mesh(device.type, (get_world_size(),), mesh_dim_names=("tp",))
+    norm = QwenRMSNorm(size=16, bias=False, init_device=device.type)
+    norm.load_state_dict(torch.load(state_path, map_location=device))
+    norm.enable_te_rms_norm()
+
+    x = torch.load(inputs_path, map_location=device)
+    rank, world_size = get_rank(), get_world_size()
+    local_x = x.chunk(world_size, dim=1)[rank].contiguous().requires_grad_(True)
+    dt_x = DTensor.from_local(
+        local_x,
+        mesh["tp"],
+        (Shard(1),),
+        run_check=False,
+        shape=x.shape,
+        stride=x.stride(),
+    )
+    y = norm(dt_x).to_local()
+    y.sum().backward()
+
+    y_ref = torch.load(outputs_path, map_location=device).chunk(world_size, dim=1)[rank]
+    torch.testing.assert_close(y, y_ref)
+    assert local_x.grad is not None
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_dtensor_te_rms_norm_keeps_sequence_sharding(backend: str, tmp_path):
+    device = torch.device("cuda") if "nccl" in backend else torch.device("cpu")
+    seed_all(0)
+    norm = QwenRMSNorm(size=16, bias=False, init_device=device.type)
+    x = torch.randn(2, 8, 16, device=device)
+    y = norm(x)
+
+    state_path = tmp_path / "norm.pt"
+    inputs_path = tmp_path / "x.pt"
+    outputs_path = tmp_path / "y.pt"
+    torch.save(norm.state_dict(), state_path)
+    torch.save(x, inputs_path)
+    torch.save(y, outputs_path)
+
+    run_distributed_test(
+        _run_dtensor_te_rms_norm,
+        backend=backend,
+        start_method="spawn",
+        func_args=(state_path, inputs_path, outputs_path),
+    )
 
 
 def test_layer_norm_builder_config():

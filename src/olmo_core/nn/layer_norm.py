@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from ..config import DType, StrEnum
 from ..exceptions import OLMoConfigurationError
@@ -84,6 +85,26 @@ class _TERMSNormFunction(torch.autograd.Function):
             None,
             None,
         )
+
+
+def _te_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    full_precision: bool,
+) -> torch.Tensor:
+    if isinstance(x, DTensor):
+        local_weight = weight.to_local() if isinstance(weight, DTensor) else weight
+        local_out = _TERMSNormFunction.apply(x.to_local(), local_weight, eps, full_precision)
+        return DTensor.from_local(
+            local_out,
+            x.device_mesh,
+            x.placements,
+            run_check=False,
+            shape=x.shape,
+            stride=x.stride(),
+        )
+    return _TERMSNormFunction.apply(x, weight, eps, full_precision)
 
 
 class LayerNormType(StrEnum):
@@ -299,7 +320,7 @@ class RMSNorm(LayerNorm):
         """
         if self._te_rms_norm_enabled:
             assert self.weight is not None
-            return _TERMSNormFunction.apply(x, self.weight, self.eps, self.full_precision)
+            return _te_rms_norm(x, self.weight, self.eps, self.full_precision)
 
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype
@@ -329,7 +350,7 @@ class QwenRMSNorm(RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._te_rms_norm_enabled:
             assert self.weight is not None
-            return _TERMSNormFunction.apply(x, self.weight, self.eps, self.full_precision)
+            return _te_rms_norm(x, self.weight, self.eps, self.full_precision)
 
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype
