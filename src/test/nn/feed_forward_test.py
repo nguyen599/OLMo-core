@@ -204,6 +204,19 @@ def test_feed_forward_te_linear_state_dict_is_checkpoint_compatible(monkeypatch)
     assert ff.w1.loaded_extra_state == {"runtime_only": True}
 
 
+def test_feed_forward_memory_profile_skips_compile_by_default(monkeypatch):
+    monkeypatch.setattr(feed_forward_mod, "_is_torch_compiling", lambda: True)
+    monkeypatch.setenv("OLMO_FF_MEMORY_PROFILE", "1")
+    monkeypatch.delenv("OLMO_FF_MEMORY_PROFILE_ALLOW_COMPILE", raising=False)
+
+    ff = FeedForward(d_model=16, hidden_size=32, init_device="cpu", bias=False)
+
+    assert not ff._should_log_memory_profile()
+
+    monkeypatch.setenv("OLMO_FF_MEMORY_PROFILE_ALLOW_COMPILE", "1")
+    assert ff._should_log_memory_profile()
+
+
 def test_feed_forward_can_enable_te_fused_glu(monkeypatch):
     monkeypatch.setattr(
         feed_forward_mod,

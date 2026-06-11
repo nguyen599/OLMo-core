@@ -40,6 +40,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_torch_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "is_compiling"):
+        return bool(compiler.is_compiling())
+    try:
+        import torch._dynamo as dynamo  # type: ignore
+
+        return bool(dynamo.is_compiling())
+    except Exception:
+        return False
+
+
 def _rank_allowed(spec: str, rank: str, local_rank: str) -> bool:
     if spec.strip().lower() in {"", "all", "*"}:
         return True
@@ -413,6 +425,8 @@ class FeedForward(nn.Module):
 
     def _should_log_memory_profile(self) -> bool:
         if not _env_flag("OLMO_FF_MEMORY_PROFILE"):
+            return False
+        if _is_torch_compiling() and not _env_flag("OLMO_FF_MEMORY_PROFILE_ALLOW_COMPILE"):
             return False
         rank = os.environ.get("RANK", os.environ.get("GLOBAL_RANK", "0"))
         local_rank = os.environ.get("LOCAL_RANK", "0")
