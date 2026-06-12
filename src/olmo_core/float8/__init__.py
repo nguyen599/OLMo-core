@@ -176,6 +176,19 @@ def _patch_blockwise_fp8_dtensor_reshape(model: nn.Module) -> int:
             x, self.weight, self.block_size, self.dtype, self.use_triton
         )
 
+    disable_dynamo = os.environ.get("OLMO_BLOCKWISE_FP8_DISABLE_DYNAMO", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if disable_dynamo:
+        forward = torch._dynamo.disable(forward)
+        log.info(
+            "Dynamo tracing disabled for torchao Float8BlockwiseLinear forward; "
+            "set OLMO_BLOCKWISE_FP8_DISABLE_DYNAMO=0 to trace it."
+        )
+
     patched = 0
     for module in model.modules():
         if isinstance(module, Float8BlockwiseLinear):
