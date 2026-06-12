@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate
 
 from ..config import DType, StrEnum
 from ..exceptions import OLMoConfigurationError
@@ -127,9 +127,50 @@ def _load_liger_megatron_rms_norm_class() -> object | None:
     return LigerMegatronRMSNorm
 
 
-def _dtensor_shards_last_dim(x: DTensor) -> bool:
-    last_dim = len(x.shape) - 1
-    return any(isinstance(placement, Shard) and placement.dim == last_dim for placement in x.placements)
+def _dtensor_has_partial_placement(x: DTensor) -> bool:
+    return any("Partial" in placement.__class__.__name__ for placement in x.placements)
+
+
+def _dtensor_replicated_placements(x: DTensor) -> tuple[Replicate, ...]:
+    return tuple(Replicate() for _ in x.placements)
+
+
+def _wrap_liger_dtensor_output(local_out: torch.Tensor, x: DTensor) -> torch.Tensor:
+    if isinstance(local_out, DTensor):
+        return local_out
+
+    out_shape = tuple(local_out.shape)
+    x_shape = tuple(x.shape)
+    x_local_shape = tuple(x.to_local().shape)
+    replicated_placements = _dtensor_replicated_placements(x)
+
+    if out_shape == x_shape:
+        replicated = DTensor.from_local(
+            local_out,
+            x.device_mesh,
+            replicated_placements,
+            run_check=False,
+            shape=x_shape,
+            stride=local_out.stride(),
+        )
+        if _dtensor_has_partial_placement(x):
+            return replicated
+        return replicated.redistribute(device_mesh=x.device_mesh, placements=x.placements)
+
+    if out_shape == x_local_shape:
+        return DTensor.from_local(
+            local_out,
+            x.device_mesh,
+            x.placements,
+            run_check=False,
+            shape=x.shape,
+            stride=x.stride(),
+        )
+
+    raise OLMoConfigurationError(
+        f"Liger RMSNorm returned shape {out_shape}, expected global DTensor shape {x_shape} "
+        f"or local DTensor shape {x_local_shape}."
+    )
 
 
 def _liger_ops_rms_norm(
@@ -146,30 +187,9 @@ def _liger_ops_rms_norm(
         )
 
     if isinstance(x, DTensor):
-        if _dtensor_shards_last_dim(x):
-            local_x = x.full_tensor()
-            local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
-            local_out = liger_fn.apply(local_x, local_weight, eps, 0.0, casting_mode, False, None)
-            replicated = DTensor.from_local(
-                local_out,
-                x.device_mesh,
-                tuple(Replicate() for _ in x.placements),
-                run_check=False,
-                shape=x.shape,
-                stride=x.stride(),
-            )
-            return replicated.redistribute(device_mesh=x.device_mesh, placements=x.placements)
-
-        local_weight = weight.to_local() if isinstance(weight, DTensor) else weight
-        local_out = liger_fn.apply(x.to_local(), local_weight, eps, 0.0, casting_mode, False, None)
-        return DTensor.from_local(
-            local_out,
-            x.device_mesh,
-            x.placements,
-            run_check=False,
-            shape=x.shape,
-            stride=x.stride(),
-        )
+        local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
+        local_out = liger_fn.apply(x, local_weight, eps, 0.0, casting_mode, False, None)
+        return _wrap_liger_dtensor_output(local_out, x)
 
     return liger_fn.apply(x, weight, eps, 0.0, casting_mode, False, None)
 
@@ -191,32 +211,11 @@ def _liger_megatron_rms_norm(
     proxy = SimpleNamespace(weight=weight, eps=eps, _offset=0.0)
 
     if isinstance(x, DTensor):
-        if _dtensor_shards_last_dim(x):
-            local_x = x.full_tensor()
-            local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
-            proxy.weight = local_weight
-            local_out = liger_cls.forward(proxy, local_x)
-            replicated = DTensor.from_local(
-                local_out,
-                x.device_mesh,
-                tuple(Replicate() for _ in x.placements),
-                run_check=False,
-                shape=x.shape,
-                stride=x.stride(),
-            )
-            return replicated.redistribute(device_mesh=x.device_mesh, placements=x.placements)
-
-        local_weight = weight.to_local() if isinstance(weight, DTensor) else weight
+        local_x = x.full_tensor()
+        local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
         proxy.weight = local_weight
-        local_out = liger_cls.forward(proxy, x.to_local())
-        return DTensor.from_local(
-            local_out,
-            x.device_mesh,
-            x.placements,
-            run_check=False,
-            shape=x.shape,
-            stride=x.stride(),
-        )
+        local_out = liger_cls.forward(proxy, local_x)
+        return _wrap_liger_dtensor_output(local_out, x)
 
     return liger_cls.forward(proxy, x)
 
