@@ -1,4 +1,5 @@
 from collections import defaultdict
+import os
 from typing import Dict, Tuple, Type
 
 import torch
@@ -13,6 +14,16 @@ def _get_custom_checkpoint_policy(meta: Dict[str, int]):
     # Adapted from
     # https://github.com/pytorch/torchtitan/blob/main/torchtitan/parallelisms/parallelize_llama.py
     from torch.utils.checkpoint import CheckpointPolicy
+
+    def parse_recompute_every() -> int:
+        raw = os.environ.get("OLMO_SELECTIVE_AC_RECOMPUTE_MM_EVERY", "2").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            return 2
+        return max(value, 0)
+
+    recompute_mm_every = parse_recompute_every()
 
     _save_list = {
         torch.ops.aten.mm.default,  # type: ignore
@@ -31,9 +42,12 @@ def _get_custom_checkpoint_policy(meta: Dict[str, int]):
         mm_count_key = f"{mode}_mm_count"
         if func == torch.ops.aten.mm.default:  # type: ignore
             meta[mm_count_key] += 1
-        # Saves output of all compute ops, except every second mm
+        # Save output of all compute ops, except a configurable fraction of mm ops.
+        # Default keeps the historical behavior: recompute every second mm.
         to_save = func in _save_list and not (
-            func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0  # type: ignore
+            func == torch.ops.aten.mm.default  # type: ignore
+            and recompute_mm_every > 0
+            and meta[mm_count_key] % recompute_mm_every == 0
         )
         return CheckpointPolicy.MUST_SAVE if to_save else CheckpointPolicy.PREFER_RECOMPUTE
 
