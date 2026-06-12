@@ -173,6 +173,7 @@ def _wrap_liger_dtensor_output(local_out: torch.Tensor, x: DTensor) -> torch.Ten
     )
 
 
+@torch.compiler.disable(recursive=False)
 def _liger_ops_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -194,6 +195,7 @@ def _liger_ops_rms_norm(
     return liger_fn.apply(x, weight, eps, 0.0, casting_mode, False, None)
 
 
+@torch.compiler.disable(recursive=False)
 def _liger_megatron_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
