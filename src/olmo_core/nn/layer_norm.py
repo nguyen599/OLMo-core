@@ -127,6 +127,14 @@ def _load_liger_megatron_rms_norm_class() -> object | None:
     return LigerMegatronRMSNorm
 
 
+def _load_quack_rms_norm_function() -> object | None:
+    try:
+        from quack import rmsnorm as rms_norm_fn  # type: ignore
+    except Exception:
+        return None
+    return rms_norm_fn
+
+
 def _dtensor_has_partial_placement(x: DTensor) -> bool:
     return any("Partial" in placement.__class__.__name__ for placement in x.placements)
 
@@ -135,7 +143,12 @@ def _dtensor_replicated_placements(x: DTensor) -> tuple[Replicate, ...]:
     return tuple(Replicate() for _ in x.placements)
 
 
-def _wrap_liger_dtensor_output(local_out: torch.Tensor, x: DTensor) -> torch.Tensor:
+def _wrap_dtensor_norm_output(
+    local_out: torch.Tensor,
+    x: DTensor,
+    *,
+    kernel_name: str,
+) -> torch.Tensor:
     if isinstance(local_out, DTensor):
         return local_out
 
@@ -168,7 +181,7 @@ def _wrap_liger_dtensor_output(local_out: torch.Tensor, x: DTensor) -> torch.Ten
         )
 
     raise OLMoConfigurationError(
-        f"Liger RMSNorm returned shape {out_shape}, expected global DTensor shape {x_shape} "
+        f"{kernel_name} RMSNorm returned shape {out_shape}, expected global DTensor shape {x_shape} "
         f"or local DTensor shape {x_local_shape}."
     )
 
@@ -190,7 +203,7 @@ def _liger_ops_rms_norm(
     if isinstance(x, DTensor):
         local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
         local_out = liger_fn.apply(x, local_weight, eps, 0.0, casting_mode, False, None)
-        return _wrap_liger_dtensor_output(local_out, x)
+        return _wrap_dtensor_norm_output(local_out, x, kernel_name="Liger")
 
     return liger_fn.apply(x, weight, eps, 0.0, casting_mode, False, None)
 
@@ -217,9 +230,42 @@ def _liger_megatron_rms_norm(
         local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
         proxy.weight = local_weight
         local_out = liger_cls.forward(proxy, local_x)
-        return _wrap_liger_dtensor_output(local_out, x)
+        return _wrap_dtensor_norm_output(local_out, x, kernel_name="Liger Megatron")
 
     return liger_cls.forward(proxy, x)
+
+
+def _quack_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    eps: float,
+) -> torch.Tensor:
+    rms_norm_fn = _load_quack_rms_norm_function()
+    if rms_norm_fn is None:
+        raise OLMoConfigurationError(
+            "Quack RMSNorm kernels are not available. Install quack or disable "
+            "Quack layer norm mode."
+        )
+
+    if isinstance(x, DTensor):
+        local_x = x.to_local()
+        local_weight = weight.to_local() if isinstance(weight, DTensor) else weight
+        local_bias = bias.to_local() if isinstance(bias, DTensor) else bias
+        local_out = rms_norm_fn(
+            local_x,
+            weight=local_weight.type_as(local_x),
+            bias=None if local_bias is None else local_bias.type_as(local_x),
+            eps=eps,
+        )
+        return _wrap_dtensor_norm_output(local_out, x, kernel_name="Quack")
+
+    return rms_norm_fn(
+        x,
+        weight=weight.type_as(x),
+        bias=None if bias is None else bias.type_as(x),
+        eps=eps,
+    ).to(x.dtype)
 
 
 class LayerNormType(StrEnum):
@@ -382,6 +428,7 @@ class LayerNorm(nn.Module):
             self.register_parameter("weight", None)
         self._te_rms_norm_enabled = False
         self._liger_rms_norm_enabled = False
+        self._quack_rms_norm_enabled = False
         self._liger_rms_norm_casting_mode = "gemma" if full_precision else "none"
         self.reset_parameters()
 
@@ -471,6 +518,16 @@ class RMSNorm(LayerNorm):
         self._liger_rms_norm_casting_mode = "megatron"
         self._liger_rms_norm_enabled = True
 
+    def enable_quack_rms_norm(self) -> None:
+        if self.weight is None:
+            raise OLMoConfigurationError("Quack RMSNorm requires elementwise_affine=True.")
+        if _load_quack_rms_norm_function() is None:
+            raise OLMoConfigurationError(
+                "Quack RMSNorm kernels are not available. Install quack or disable "
+                "Quack layer norm mode."
+            )
+        self._quack_rms_norm_enabled = True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply RMSNorm.
@@ -485,6 +542,9 @@ class RMSNorm(LayerNorm):
             if self._liger_rms_norm_casting_mode == "megatron":
                 return _liger_megatron_rms_norm(x, self.weight, self.eps)
             return _liger_ops_rms_norm(x, self.weight, self.eps, self._liger_rms_norm_casting_mode)
+        if self._quack_rms_norm_enabled:
+            assert self.weight is not None
+            return _quack_rms_norm(x, self.weight, self.bias, self.eps)
 
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype
@@ -526,6 +586,9 @@ class QwenRMSNorm(RMSNorm):
             if self._liger_rms_norm_casting_mode == "megatron":
                 return _liger_megatron_rms_norm(x, self.weight, self.eps)
             return _liger_ops_rms_norm(x, self.weight, self.eps, self._liger_rms_norm_casting_mode)
+        if self._quack_rms_norm_enabled:
+            assert self.weight is not None
+            return _quack_rms_norm(x, self.weight, self.bias, self.eps)
 
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype

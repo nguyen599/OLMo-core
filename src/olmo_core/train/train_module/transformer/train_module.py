@@ -87,6 +87,7 @@ class TransformerTrainModule(TrainModule):
     :param te_layer_norm: Use Transformer Engine kernels for RMSNorm layers.
     :param liger_layer_norm: Use Liger Triton kernels for RMSNorm layers.
     :param liger_megatron_layer_norm: Use Liger's Megatron-Core RMSNorm wrapper.
+    :param quack_layer_norm: Use Quack CuTe kernels for RMSNorm layers.
     :param feed_forward_chunk_size_tokens: Token chunk size for feed-forward projections.
     :param dp_config: Data parallel configuration for the model.
     :param tp_config: Tensor parallel configuration for the model.
@@ -118,6 +119,7 @@ class TransformerTrainModule(TrainModule):
         te_layer_norm: bool = False,
         liger_layer_norm: bool = False,
         liger_megatron_layer_norm: bool = False,
+        quack_layer_norm: bool = False,
         feed_forward_chunk_size_tokens: int = 0,
         dp_config: Optional[TransformerDataParallelConfig] = None,
         tp_config: Optional[TransformerTensorParallelConfig] = None,
@@ -184,6 +186,7 @@ class TransformerTrainModule(TrainModule):
             te_layer_norm=te_layer_norm,
             liger_layer_norm=liger_layer_norm,
             liger_megatron_layer_norm=liger_megatron_layer_norm,
+            quack_layer_norm=quack_layer_norm,
             feed_forward_chunk_size_tokens=feed_forward_chunk_size_tokens,
             dp_config=dp_config,
             tp_config=tp_config,
