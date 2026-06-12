@@ -125,6 +125,8 @@ def parallelize_model(
     te_feed_forward: bool = False,
     te_feed_forward_glu: bool = False,
     te_layer_norm: bool = False,
+    liger_layer_norm: bool = False,
+    liger_megatron_layer_norm: bool = False,
     feed_forward_chunk_size_tokens: int = 0,
     dp_config: Optional[TransformerDataParallelConfig] = None,
     tp_config: Optional[TransformerTensorParallelConfig] = None,
@@ -156,6 +158,12 @@ def parallelize_model(
                 "Transformer Engine feed-forward modes cannot be combined with torchao Float8Linear."
             )
 
+    norm_modes = sum(bool(mode) for mode in (te_layer_norm, liger_layer_norm, liger_megatron_layer_norm))
+    if norm_modes > 1:
+        raise OLMoConfigurationError(
+            "Transformer Engine, Liger, and Liger Megatron RMSNorm modes are mutually exclusive."
+        )
+
     if te_layer_norm:
         swapped = 0
         for m in model_parts:
@@ -164,6 +172,24 @@ def parallelize_model(
                     module.enable_te_rms_norm()
                     swapped += 1
         log.info("Enabled Transformer Engine RMSNorm kernels for %d norm module(s)", swapped)
+
+    if liger_layer_norm:
+        swapped = 0
+        for m in model_parts:
+            for module in m.modules():
+                if isinstance(module, RMSNorm):
+                    module.enable_liger_rms_norm()
+                    swapped += 1
+        log.info("Enabled Liger RMSNorm kernels for %d norm module(s)", swapped)
+
+    if liger_megatron_layer_norm:
+        swapped = 0
+        for m in model_parts:
+            for module in m.modules():
+                if isinstance(module, RMSNorm):
+                    module.enable_liger_megatron_rms_norm()
+                    swapped += 1
+        log.info("Enabled Liger Megatron RMSNorm kernels for %d norm module(s)", swapped)
 
     if te_feed_forward:
         if tp_config is not None and tp_config.degree > 1:

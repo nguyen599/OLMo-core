@@ -89,6 +89,8 @@ class TransformerPipelineTrainModule(TrainModule):
     :param te_feed_forward: Replace dense feed-forward linears with Transformer Engine Linear.
     :param te_feed_forward_glu: Use Transformer Engine fused GLU activation in feed-forward layers.
     :param te_layer_norm: Use Transformer Engine kernels for RMSNorm layers.
+    :param liger_layer_norm: Use Liger Triton kernels for RMSNorm layers.
+    :param liger_megatron_layer_norm: Use Liger's Megatron-Core RMSNorm wrapper.
     :param feed_forward_chunk_size_tokens: Token chunk size for feed-forward projections.
     :param dp_config: Data parallel configuration for the model.
     :param tp_config: Tensor parallel configuration for the model.
@@ -120,6 +122,8 @@ class TransformerPipelineTrainModule(TrainModule):
         te_feed_forward: bool = False,
         te_feed_forward_glu: bool = False,
         te_layer_norm: bool = False,
+        liger_layer_norm: bool = False,
+        liger_megatron_layer_norm: bool = False,
         feed_forward_chunk_size_tokens: int = 0,
         dp_config: Optional[TransformerDataParallelConfig] = None,
         tp_config: Optional[TransformerTensorParallelConfig] = None,
@@ -194,6 +198,8 @@ class TransformerPipelineTrainModule(TrainModule):
             te_feed_forward=te_feed_forward,
             te_feed_forward_glu=te_feed_forward_glu,
             te_layer_norm=te_layer_norm,
+            liger_layer_norm=liger_layer_norm,
+            liger_megatron_layer_norm=liger_megatron_layer_norm,
             feed_forward_chunk_size_tokens=feed_forward_chunk_size_tokens,
             dp_config=dp_config,
             tp_config=tp_config,

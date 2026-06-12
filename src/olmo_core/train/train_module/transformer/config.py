@@ -477,6 +477,8 @@ class TransformerTrainModuleConfig(TrainModuleConfig):
     te_feed_forward: bool = False
     te_feed_forward_glu: bool = False
     te_layer_norm: bool = False
+    liger_layer_norm: bool = False
+    liger_megatron_layer_norm: bool = False
     feed_forward_chunk_size_tokens: int = 0
     pp_config: Optional[TransformerPipelineParallelConfig] = None
     dp_config: Optional[TransformerDataParallelConfig] = None

@@ -1,11 +1,12 @@
 from dataclasses import dataclass
 import math
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from ..config import DType, StrEnum
 from ..exceptions import OLMoConfigurationError
@@ -20,6 +21,8 @@ __all__ = [
     "QwenRMSNorm",
     "CuTeRMSNorm",
     "FusedRMSNorm",
+    "LigerRMSNorm",
+    "LigerMegatronRMSNorm",
     "L2Norm",
 ]
 
@@ -107,6 +110,117 @@ def _te_rms_norm(
     return _TERMSNormFunction.apply(x, weight, eps, full_precision)
 
 
+def _load_liger_rms_norm_function() -> object | None:
+    try:
+        import torch.distributed.tensor  # noqa: F401
+        from liger_kernel.ops import LigerRMSNormFunction  # type: ignore
+    except Exception:
+        return None
+    return LigerRMSNormFunction
+
+
+def _load_liger_megatron_rms_norm_class() -> object | None:
+    try:
+        from liger_kernel.megatron.rms_norm import LigerMegatronRMSNorm  # type: ignore
+    except Exception:
+        return None
+    return LigerMegatronRMSNorm
+
+
+def _dtensor_shards_last_dim(x: DTensor) -> bool:
+    last_dim = len(x.shape) - 1
+    return any(isinstance(placement, Shard) and placement.dim == last_dim for placement in x.placements)
+
+
+def _liger_ops_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    casting_mode: str,
+) -> torch.Tensor:
+    liger_fn = _load_liger_rms_norm_function()
+    if liger_fn is None:
+        raise OLMoConfigurationError(
+            "Liger RMSNorm kernels are not available. Install liger-kernel or disable "
+            "Liger layer norm mode."
+        )
+
+    if isinstance(x, DTensor):
+        if _dtensor_shards_last_dim(x):
+            local_x = x.full_tensor()
+            local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
+            local_out = liger_fn.apply(local_x, local_weight, eps, 0.0, casting_mode, False, None)
+            replicated = DTensor.from_local(
+                local_out,
+                x.device_mesh,
+                tuple(Replicate() for _ in x.placements),
+                run_check=False,
+                shape=x.shape,
+                stride=x.stride(),
+            )
+            return replicated.redistribute(device_mesh=x.device_mesh, placements=x.placements)
+
+        local_weight = weight.to_local() if isinstance(weight, DTensor) else weight
+        local_out = liger_fn.apply(x.to_local(), local_weight, eps, 0.0, casting_mode, False, None)
+        return DTensor.from_local(
+            local_out,
+            x.device_mesh,
+            x.placements,
+            run_check=False,
+            shape=x.shape,
+            stride=x.stride(),
+        )
+
+    return liger_fn.apply(x, weight, eps, 0.0, casting_mode, False, None)
+
+
+def _liger_megatron_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    liger_cls = _load_liger_megatron_rms_norm_class()
+    if liger_cls is None:
+        raise OLMoConfigurationError(
+            "Liger RMSNorm kernels are not available. Install liger-kernel or disable "
+            "Liger layer norm mode."
+        )
+    # Call through Liger's Megatron-Core integration path. A light proxy lets
+    # OLMo keep its own checkpoint parameter names while using the upstream
+    # Megatron wrapper's forward implementation.
+    proxy = SimpleNamespace(weight=weight, eps=eps, _offset=0.0)
+
+    if isinstance(x, DTensor):
+        if _dtensor_shards_last_dim(x):
+            local_x = x.full_tensor()
+            local_weight = weight.full_tensor() if isinstance(weight, DTensor) else weight
+            proxy.weight = local_weight
+            local_out = liger_cls.forward(proxy, local_x)
+            replicated = DTensor.from_local(
+                local_out,
+                x.device_mesh,
+                tuple(Replicate() for _ in x.placements),
+                run_check=False,
+                shape=x.shape,
+                stride=x.stride(),
+            )
+            return replicated.redistribute(device_mesh=x.device_mesh, placements=x.placements)
+
+        local_weight = weight.to_local() if isinstance(weight, DTensor) else weight
+        proxy.weight = local_weight
+        local_out = liger_cls.forward(proxy, x.to_local())
+        return DTensor.from_local(
+            local_out,
+            x.device_mesh,
+            x.placements,
+            run_check=False,
+            shape=x.shape,
+            stride=x.stride(),
+        )
+
+    return liger_cls.forward(proxy, x)
+
+
 class LayerNormType(StrEnum):
     """
     An enumeration of the different layer norm implementations.
@@ -131,6 +245,14 @@ class LayerNormType(StrEnum):
     fused_rms = "fused_rms"
     """
     ➡️ :class:`FusedRMSNorm`
+    """
+    liger_rms = "liger_rms"
+    """
+    ➡️ :class:`LigerRMSNorm`
+    """
+    liger_megatron_rms = "liger_megatron_rms"
+    """
+    ➡️ :class:`LigerMegatronRMSNorm`
     """
     l2_norm = "l2_norm"
     """
@@ -198,6 +320,10 @@ class LayerNormConfig(ModuleConfig):
                 return CuTeRMSNorm(size=size, init_device=init_device, **kwargs)
             elif self.name == LayerNormType.fused_rms:
                 return FusedRMSNorm(size=size, init_device=init_device, **kwargs)
+            elif self.name == LayerNormType.liger_rms:
+                return LigerRMSNorm(size=size, init_device=init_device, **kwargs)
+            elif self.name == LayerNormType.liger_megatron_rms:
+                return LigerMegatronRMSNorm(size=size, init_device=init_device, **kwargs)
             elif self.name == LayerNormType.l2_norm:
                 return L2Norm(size=size, **kwargs)
             else:
@@ -254,6 +380,8 @@ class LayerNorm(nn.Module):
             self.register_parameter("bias", None)
             self.register_parameter("weight", None)
         self._te_rms_norm_enabled = False
+        self._liger_rms_norm_enabled = False
+        self._liger_rms_norm_casting_mode = "gemma" if full_precision else "none"
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -312,6 +440,36 @@ class RMSNorm(LayerNorm):
             )
         self._te_rms_norm_enabled = True
 
+    def enable_liger_rms_norm(self, casting_mode: Optional[str] = None) -> None:
+        if self.weight is None:
+            raise OLMoConfigurationError("Liger RMSNorm requires elementwise_affine=True.")
+        if self.bias is not None:
+            raise OLMoConfigurationError("Liger RMSNorm does not support bias.")
+        if _load_liger_rms_norm_function() is None:
+            raise OLMoConfigurationError(
+                "Liger RMSNorm kernels are not available. Install liger-kernel or disable "
+                "Liger layer norm mode."
+            )
+        self._liger_rms_norm_casting_mode = casting_mode or ("gemma" if self.full_precision else "none")
+        self._liger_rms_norm_enabled = True
+
+    def enable_liger_megatron_rms_norm(self, casting_mode: Optional[str] = None) -> None:
+        if self.weight is None:
+            raise OLMoConfigurationError("Liger Megatron RMSNorm requires elementwise_affine=True.")
+        if self.bias is not None:
+            raise OLMoConfigurationError("Liger Megatron RMSNorm does not support bias.")
+        if casting_mode not in (None, "llama"):
+            raise OLMoConfigurationError(
+                "The Liger Megatron RMSNorm path only exposes Llama-style casting."
+            )
+        if _load_liger_megatron_rms_norm_class() is None:
+            raise OLMoConfigurationError(
+                "Liger RMSNorm kernels are not available. Install liger-kernel or disable "
+                "Liger layer norm mode."
+            )
+        self._liger_rms_norm_casting_mode = "megatron"
+        self._liger_rms_norm_enabled = True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Apply RMSNorm.
@@ -321,6 +479,11 @@ class RMSNorm(LayerNorm):
         if self._te_rms_norm_enabled:
             assert self.weight is not None
             return _te_rms_norm(x, self.weight, self.eps, self.full_precision)
+        if self._liger_rms_norm_enabled:
+            assert self.weight is not None
+            if self._liger_rms_norm_casting_mode == "megatron":
+                return _liger_megatron_rms_norm(x, self.weight, self.eps)
+            return _liger_ops_rms_norm(x, self.weight, self.eps, self._liger_rms_norm_casting_mode)
 
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype
@@ -347,10 +510,21 @@ class QwenRMSNorm(RMSNorm):
     weight multiply happens in the input dtype rather than fp32.
     """
 
+    def enable_liger_rms_norm(self, casting_mode: Optional[str] = None) -> None:
+        super().enable_liger_rms_norm(casting_mode or "llama")
+
+    def enable_liger_megatron_rms_norm(self, casting_mode: Optional[str] = None) -> None:
+        super().enable_liger_megatron_rms_norm(casting_mode or "llama")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._te_rms_norm_enabled:
             assert self.weight is not None
             return _te_rms_norm(x, self.weight, self.eps, self.full_precision)
+        if self._liger_rms_norm_enabled:
+            assert self.weight is not None
+            if self._liger_rms_norm_casting_mode == "megatron":
+                return _liger_megatron_rms_norm(x, self.weight, self.eps)
+            return _liger_ops_rms_norm(x, self.weight, self.eps, self._liger_rms_norm_casting_mode)
 
         with torch.autocast(enabled=False, device_type=x.device.type):
             og_dtype = x.dtype
@@ -473,6 +647,67 @@ class FusedRMSNorm(RMSNorm):
             None if self.bias is None else self.bias.type_as(x),
             eps=self.eps,
         ).to(og_dtype)
+
+
+class LigerRMSNorm(RMSNorm):
+    """
+    A Liger Triton-kernel implementation of :class:`RMSNorm`.
+
+    This calls through the normal ``liger_kernel.ops.LigerRMSNormFunction``
+    path while preserving OLMo checkpoint parameter names.
+    """
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        full_precision: bool = True,
+        init_device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__(
+            size=size,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            full_precision=full_precision,
+            dtype=dtype,
+            init_device=init_device,
+        )
+        self.enable_liger_rms_norm("gemma" if full_precision else "none")
+
+
+class LigerMegatronRMSNorm(RMSNorm):
+    """
+    A Liger Megatron-Core RMSNorm implementation that calls through
+    ``liger_kernel.megatron.rms_norm.LigerMegatronRMSNorm`` while preserving
+    OLMo checkpoint parameter names.
+    """
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        bias: bool = True,
+        full_precision: bool = True,
+        init_device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__(
+            size=size,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            bias=bias,
+            full_precision=full_precision,
+            dtype=dtype,
+            init_device=init_device,
+        )
+        self.enable_liger_megatron_rms_norm("llama")
 
 
 class L2Norm(LayerNorm):
