@@ -220,9 +220,14 @@ def parallelize_model(
 
     # Maybe apply FP8 training.
     if float8_config is not None and float8_config.enabled:
-        for m in model_parts:
+        for part_idx, m in enumerate(model_parts):
             m.apply_fp8(float8_config)
-            log.info("Swapped linear layers to Float8 linear layers\n%s", m)
+            swapped = sum(
+                1
+                for module in m.modules()
+                if type(module).__name__ in {"Float8Linear", "Float8BlockwiseLinear", "MXLinear"}
+            )
+            log.info("Swapped %d linear layer(s) to Float8 modules in model part %d", swapped, part_idx)
 
     # Maybe apply context parallelism.
     if cp_config is not None:
