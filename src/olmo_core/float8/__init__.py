@@ -3,6 +3,7 @@ Utilities for training in Float8 via `torchao <https://github.com/pytorch/ao>`_.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Set
 
@@ -33,6 +34,10 @@ class Float8Config(Config):
     ao: Optional[AOFloat8LinearConfig] = None
     ao_recipe: Optional[AOFloat8LinearRecipe] = None
     ao_mx: Optional[AOMXLinearConfig] = None
+    ao_blockwise: bool = False
+    """Use torchao.prototype.blockwise_fp8_training.Float8BlockwiseLinear."""
+    ao_blockwise_use_triton: bool = False
+    """Use torchao's Triton blockwise kernels instead of torch/F.scaled_mm when possible."""
 
     modules_to_ignore: Optional[List[str]] = None
     """A set of fully-qualified module names to ignore for Float8 conversion."""
@@ -44,22 +49,36 @@ class Float8Config(Config):
 
     def validate(self):
         config_count = sum(
-            [self.ao is not None, self.ao_recipe is not None, self.ao_mx is not None]
+            [
+                self.ao is not None,
+                self.ao_recipe is not None,
+                self.ao_mx is not None,
+                self.ao_blockwise,
+            ]
         )
         if config_count > 1:
             raise OLMoConfigurationError(
-                "'ao', 'ao_recipe', and 'ao_mx' configs are mutually exclusive"
+                "'ao', 'ao_recipe', 'ao_mx', and 'ao_blockwise' configs are mutually exclusive"
             )
 
     @property
     def should_precompute_float8_dynamic_scale_for_fsdp(self):
-        if self.ao_recipe is not None or self.ao_mx is not None:
+        if self.ao_recipe is not None or self.ao_mx is not None or self.ao_blockwise:
             return False
 
         float8_linear_config = (
             self.ao if self.ao is not None else AOFloat8LinearConfig()
         ).to_ao_type()
         return float8_linear_config.enable_fsdp_float8_all_gather
+
+    @property
+    def should_use_float8_tp_wrappers(self):
+        """
+        Only torchao ``Float8Linear`` supports torchao's Float8 TP wrappers.
+        MX and blockwise FP8 modules keep ordinary trainable parameters and use
+        standard TP sharding.
+        """
+        return self.ao_mx is None and not self.ao_blockwise
 
     def apply_float8_linear(
         self, model: nn.Module, *, modules_to_ignore: Optional[Set[str]] = None
@@ -114,10 +133,43 @@ class Float8Config(Config):
             if not p.requires_grad:
                 frozen_params.add(n)
 
+        # Handle torchao's SM90 blockwise FP8 training module.
+        if self.ao_blockwise:
+            from torchao.prototype.blockwise_fp8_training.linear import (
+                Float8BlockwiseLinear,
+                Float8BlockwiseLinearConfig,
+            )
+            from torchao.quantization import quantize_ as ao_quantize_
+
+            ao_quantize_(
+                model,
+                config=Float8BlockwiseLinearConfig(),
+                filter_fn=quantize_filter_fn,  # !!! Opposite semantics of the module_filter_fn below
+            )
+            if self.ao_blockwise_use_triton:
+                for module in model.modules():
+                    if isinstance(module, Float8BlockwiseLinear):
+                        module.use_triton = True
+
         # Handle MX format conversion
-        if self.ao_mx is not None:
+        elif self.ao_mx is not None:
+            allow_sm90 = os.environ.get("OLMO_ALLOW_MXFP8_SM90", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
             if not has_compute_capability(10, 0):
-                raise RuntimeError("MX format training is only supported on SM100 or later")
+                if allow_sm90 and has_compute_capability(9, 0):
+                    log.warning(
+                        "MX format training is running on SM90 because OLMO_ALLOW_MXFP8_SM90=1. "
+                        "This is experimental and may fail depending on the installed torchao kernels."
+                    )
+                else:
+                    raise RuntimeError(
+                        "MX format training is only supported on SM100 or later by default. "
+                        "Set OLMO_ALLOW_MXFP8_SM90=1 to run an experimental SM90/H200 probe."
+                    )
 
             from torchao.quantization import quantize_ as ao_quantize_
 

@@ -171,6 +171,7 @@ class Transformer(nn.Module):
         self._pp_enabled = False
         self._pp_group_size = 1
         self._fp8_enabled = False
+        self._use_float8_tp_wrappers = False
         self._precompute_float8_dynamic_scale_for_fsdp = False
         self._compile_enabled = False
         self._device: Optional[torch.device] = None
@@ -596,6 +597,7 @@ class Transformer(nn.Module):
         float8_config.apply_float8_linear(self, modules_to_ignore=modules_to_ignore)
 
         self._fp8_enabled = True
+        self._use_float8_tp_wrappers = float8_config.should_use_float8_tp_wrappers
         self._precompute_float8_dynamic_scale_for_fsdp = (
             float8_config.should_precompute_float8_dynamic_scale_for_fsdp
         )
@@ -618,8 +620,8 @@ class Transformer(nn.Module):
         :param float8_enabled: Set this to ``True`` if training with float8 linear layers.
         """
         if float8_enabled is None:
-            float8_enabled = self.fp8_enabled
-        elif not float8_enabled and self.fp8_enabled:
+            float8_enabled = self.fp8_enabled and self._use_float8_tp_wrappers
+        elif not float8_enabled and self.fp8_enabled and self._use_float8_tp_wrappers:
             raise OLMoConfigurationError(
                 "Got 'float8_enabled=False', but FP8 has already been enabled"
             )
