@@ -1,6 +1,6 @@
 try:
     import transformer_engine.pytorch as te  # type: ignore
-except ImportError:
+except (ImportError, OSError):
     te = None
 
 
