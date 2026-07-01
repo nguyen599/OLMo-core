@@ -177,6 +177,82 @@ def dispatch_flash_attn_3(
         )
 
 
+class _Flash3AttnSinkMerge(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, out: torch.Tensor, lse: torch.Tensor, sink: torch.Tensor) -> torch.Tensor:
+        z = sink.unsqueeze(1) - lse
+        inv_scale = torch.reciprocal(1.0 + torch.exp(z))
+        out.data.mul_(inv_scale.transpose(0, 1).unsqueeze(-1).to(out.dtype))
+        lse.data.add_(torch.log1p(torch.exp(z)))
+        ctx.save_for_backward(out, lse, sink)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout: torch.Tensor):
+        out, lse, sink = ctx.saved_tensors
+        delta = torch.sum(out * dout, dim=-1)
+        p_sink = torch.exp(sink.unsqueeze(1) - lse)
+        dsink = -(p_sink * delta.transpose(0, 1)).sum(dim=-1)
+        return dout, None, dsink
+
+
+def dispatch_flash_attn_3_with_sink(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sink: torch.Tensor,
+    *,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+) -> torch.Tensor:
+    if flash_attn_3 is None:
+        raise RuntimeError("flash-attn 3 is required!")
+
+    if cu_seqlens is not None:
+        cu_seqlens_q = cu_seqlens if cu_seqlens_q is None else cu_seqlens_q
+        cu_seqlens_k = cu_seqlens if cu_seqlens_k is None else cu_seqlens_k
+    if max_seqlen is not None:
+        max_seqlen_q = max_seqlen if max_seqlen_q is None else max_seqlen_q
+        max_seqlen_k = max_seqlen if max_seqlen_k is None else max_seqlen_k
+
+    q_flat = _flatten_batch_dim(q)
+    k_flat = _flatten_batch_dim(k)
+    v_flat = _flatten_batch_dim(v)
+    if not all(x is not None for x in (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)):
+        B, T = q.shape[:2]
+        cu_seqlens_q = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=q.device)
+        cu_seqlens_k = cu_seqlens_q
+        max_seqlen_q = max_seqlen_k = T
+
+    if sink.numel() != q_flat.shape[1]:
+        raise RuntimeError(
+            f"attention sink has {sink.numel()} heads, but query has {q_flat.shape[1]} heads"
+        )
+
+    res = flash_attn_3.flash_attn_varlen_func(
+        q_flat,
+        k_flat,
+        v_flat,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        return_attn_probs=True,
+    )
+    out, lse = res[0], res[1]
+    return _Flash3AttnSinkMerge.apply(out, lse, sink.to(lse.dtype))
+
+
 def dispatch_flash_attn_qkvpacked(
     qkv: torch.Tensor,
     *,

@@ -23,6 +23,7 @@ from .flash_attn_api import (
     dispatch_flash_attn_3,
     dispatch_flash_attn_3_qkvpacked,
     dispatch_flash_attn_3_with_kvcache,
+    dispatch_flash_attn_3_with_sink,
     dispatch_flash_attn_4,
     dispatch_flash_attn_qkvpacked,
     dispatch_flash_attn_with_kvcache,
@@ -259,6 +260,7 @@ class AttentionBackend(nn.Module):
     def forward(
         self,
         qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        attention_sink: Optional[torch.Tensor] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
         cu_doc_lens_q: Optional[torch.Tensor] = None,
         cu_doc_lens_k: Optional[torch.Tensor] = None,
@@ -335,6 +337,7 @@ class TorchAttentionBackend(AttentionBackend):
     def forward(
         self,
         qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        attention_sink: Optional[torch.Tensor] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
         cu_doc_lens_q: Optional[torch.Tensor] = None,
         cu_doc_lens_k: Optional[torch.Tensor] = None,
@@ -350,6 +353,9 @@ class TorchAttentionBackend(AttentionBackend):
             raise RuntimeError(f"'{self.__class__.__name__}' doesn't support packed QKV")
 
         q, k, v = qkv
+
+        if attention_sink is not None and self.cp_enabled:
+            raise RuntimeError(f"'{self.__class__.__name__}' doesn't support attention sinks with CP")
 
         if kv_cache_manager is not None:
             raise RuntimeError(f"'{self.__class__.__name__}' doesn't support KV caching")
@@ -397,16 +403,37 @@ class TorchAttentionBackend(AttentionBackend):
         #        (batch_size, n_kv_heads, seq_len, head_dim)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        # shape: (batch_size, n_heads, seq_len, head_dim)
-        att = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout_p,
-            is_causal=attn_mask is None,
-            scale=self.scale,
-        )
+        if attention_sink is None:
+            # shape: (batch_size, n_heads, seq_len, head_dim)
+            att = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_p,
+                is_causal=attn_mask is None,
+                scale=self.scale,
+            )
+        else:
+            if attention_sink.numel() != q.shape[1]:
+                raise RuntimeError(
+                    f"attention sink has {attention_sink.numel()} heads, but query has {q.shape[1]} heads"
+                )
+            if attn_mask is None:
+                attn_mask = self._get_sliding_window_mask(
+                    seq_len_q=q.shape[-2],
+                    seq_len_kv=k.shape[-2],
+                    device=q.device,
+                    window_size=self.window_size,
+                )
+            scale = self.scale if self.scale is not None else q.shape[-1] ** -0.5
+            attn_weights = torch.matmul(q, k.transpose(2, 3)) * scale
+            attn_weights = attn_weights.masked_fill(~attn_mask, torch.finfo(attn_weights.dtype).min)
+            sinks = attention_sink.reshape(1, -1, 1, 1).expand(q.shape[0], -1, q.shape[-2], 1)
+            combined = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1).float()
+            probs = torch.softmax(combined, dim=-1)[..., :-1].to(q.dtype)
+            probs = F.dropout(probs, p=self.dropout_p, training=self.training)
+            att = torch.matmul(probs, v)
 
         # shape: (batch_size, seq_len, n_heads, head_dim)
         att = att.transpose(1, 2)
@@ -518,6 +545,7 @@ class FlashAttention2Backend(AttentionBackend):
     def forward(
         self,
         qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        attention_sink: Optional[torch.Tensor] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
         cu_doc_lens_q: Optional[torch.Tensor] = None,
         cu_doc_lens_k: Optional[torch.Tensor] = None,
@@ -527,6 +555,9 @@ class FlashAttention2Backend(AttentionBackend):
         local_k_slice: Optional[slice] = None,
         kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> torch.Tensor:
+        if attention_sink is not None:
+            raise RuntimeError(f"'{self.__class__.__name__}' doesn't support attention sinks")
+
         if isinstance(qkv, torch.Tensor):
             if kv_cache_manager is not None:
                 raise RuntimeError(
@@ -742,6 +773,7 @@ class FlashAttention3Backend(AttentionBackend):
     def forward(
         self,
         qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        attention_sink: Optional[torch.Tensor] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
         cu_doc_lens_q: Optional[torch.Tensor] = None,
         cu_doc_lens_k: Optional[torch.Tensor] = None,
@@ -752,6 +784,11 @@ class FlashAttention3Backend(AttentionBackend):
         kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> torch.Tensor:
         if isinstance(qkv, torch.Tensor):
+            if attention_sink is not None:
+                raise RuntimeError(
+                    f"'{self.__class__.__name__}' doesn't support attention sinks with packed QKV"
+                )
+
             if kv_cache_manager is not None:
                 raise RuntimeError(
                     f"'{self.__class__.__name__}' doesn't support packed QKV with KV caching"
@@ -804,7 +841,14 @@ class FlashAttention3Backend(AttentionBackend):
 
         q, k, v = qkv
 
+        if attention_sink is not None and self.cp_enabled:
+            raise RuntimeError(f"'{self.__class__.__name__}' doesn't support attention sinks with CP")
+
         if kv_cache_manager:
+            if attention_sink is not None:
+                raise RuntimeError(
+                    f"'{self.__class__.__name__}' doesn't support attention sinks with KV caching"
+                )
             if self.cp_enabled:
                 raise RuntimeError(
                     f"'{self.__class__.__name__}' doesn't support KV caching with context parallelism"
@@ -863,6 +907,23 @@ class FlashAttention3Backend(AttentionBackend):
                 return all_to_all_single_hp2cp(out.view(B, T, H_local, D), self.cp_pg)
             else:
                 raise RuntimeError("One of ring or uly must be specified")
+
+        if attention_sink is not None:
+            return dispatch_flash_attn_3_with_sink(
+                q,
+                k,
+                v,
+                attention_sink,
+                cu_seqlens=cu_doc_lens,
+                cu_seqlens_q=cu_doc_lens_q,
+                cu_seqlens_k=cu_doc_lens_k,
+                max_seqlen=max_doc_len,
+                max_seqlen_q=max_doc_len_q,
+                max_seqlen_k=max_doc_len_k,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=self.window_size,
+            )
 
         return dispatch_flash_attn_3(
             q,
@@ -938,6 +999,7 @@ class FlashAttention4Backend(AttentionBackend):
     def forward(
         self,
         qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        attention_sink: Optional[torch.Tensor] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
         cu_doc_lens_q: Optional[torch.Tensor] = None,
         cu_doc_lens_k: Optional[torch.Tensor] = None,
@@ -947,6 +1009,9 @@ class FlashAttention4Backend(AttentionBackend):
         local_k_slice: Optional[slice] = None,
         kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> torch.Tensor:
+        if attention_sink is not None:
+            raise RuntimeError(f"'{self.__class__.__name__}' doesn't support attention sinks")
+
         assert isinstance(qkv, tuple), f"'{self.__class__.__name__}' requires unpacked QKV"
         assert local_k_slice is None, f"'{self.__class__.__name__}' doesn't support local_k_slice"
 
@@ -1211,6 +1276,7 @@ class TEAttentionBackend(AttentionBackend):
     def forward(
         self,
         qkv: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        attention_sink: Optional[torch.Tensor] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
         cu_doc_lens_q: Optional[torch.Tensor] = None,
         cu_doc_lens_k: Optional[torch.Tensor] = None,
@@ -1221,6 +1287,9 @@ class TEAttentionBackend(AttentionBackend):
         kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> torch.Tensor:
         del local_k_slice
+
+        if attention_sink is not None:
+            raise RuntimeError(f"'{self.__class__.__name__}' doesn't support attention sinks")
 
         if kv_cache_manager is not None:
             raise RuntimeError(f"'{self.__class__.__name__}' doesn't support KV caching")

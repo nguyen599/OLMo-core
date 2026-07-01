@@ -1,4 +1,5 @@
 import logging
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional
@@ -6,6 +7,7 @@ from typing import Any, Dict, Generator, Optional
 import torch
 import torch.distributed as dist
 from huggingface_hub import repo_exists
+from safetensors import safe_open
 from torch.distributed.tensor import DTensor, distribute_tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -38,6 +40,38 @@ except ImportError:
 
 
 log = logging.getLogger(__name__)
+
+
+def _load_local_hf_state_dict(model_path: Path) -> Dict[str, torch.Tensor] | None:
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = index.get("weight_map") or {}
+        state: Dict[str, torch.Tensor] = {}
+        for shard_name in sorted(set(weight_map.values())):
+            shard_path = model_path / shard_name
+            with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                for key in shard.keys():
+                    state[key] = shard.get_tensor(key)
+        return state
+
+    safetensors_path = model_path / "model.safetensors"
+    if safetensors_path.is_file():
+        state = {}
+        with safe_open(safetensors_path, framework="pt", device="cpu") as shard:
+            for key in shard.keys():
+                state[key] = shard.get_tensor(key)
+        return state
+
+    bin_path = model_path / "pytorch_model.bin"
+    if bin_path.is_file():
+        loaded = torch.load(bin_path, map_location="cpu")
+        if isinstance(loaded, dict) and "state_dict" in loaded:
+            loaded = loaded["state_dict"]
+        if isinstance(loaded, dict):
+            return loaded
+
+    return None
 
 
 @beta_feature
@@ -98,20 +132,43 @@ def load_hf_model(
     else:
         raise NotImplementedError
 
-    # Warm up the HF local cache by downloading the model on just local rank 0
-    if get_fs_local_rank() == 0:
-        hf_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, revision=revision)
-        del hf_model
-    barrier(group=process_group)
+    hf_config = None
+    hf_state_dict = None
+    if Path(model_name_or_path).is_dir():
+        hf_state_dict = _load_local_hf_state_dict(Path(model_name_or_path))
 
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name_or_path, revision=revision)
-    log.info(f"Loaded hf model: {hf_model}")
-    hf_model.resize_token_embeddings(num_embeddings)
+    if hf_state_dict is None:
+        # Warm up the HF local cache by downloading the model on just local rank 0
+        if get_fs_local_rank() == 0:
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path, revision=revision, trust_remote_code=True
+            )
+            del hf_model
+        barrier(group=process_group)
+
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path, revision=revision, trust_remote_code=True
+        )
+        log.info(f"Loaded hf model: {hf_model}")
+        hf_model.resize_token_embeddings(num_embeddings)
+        hf_config = hf_model.config
+        hf_state_dict = hf_model.state_dict()
+    else:
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(
+            model_name_or_path, revision=revision, trust_remote_code=True
+        )
+        log.info(
+            "Loaded raw local HF state dict from '%s' with %d tensor(s)",
+            model_name_or_path,
+            len(hf_state_dict),
+        )
 
     converted_state_dict: Dict[str, torch.Tensor] = convert_state_from_hf(
-        hf_model.config,
-        hf_model.state_dict(),
-        model_type=getattr(hf_model.config, "model_type", None),
+        hf_config,
+        hf_state_dict,
+        model_type=getattr(hf_config, "model_type", None),
     )
 
     for key in sorted(converted_state_dict.keys()):

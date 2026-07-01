@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Placement, Replicate, Shard
-from torch.distributed.tensor.parallel import parallelize_module
+from torch.distributed.tensor import DTensor, Placement, Replicate, Shard
+from torch.distributed.tensor.parallel import ColwiseParallel, parallelize_module
 
 from olmo_core.config import Config, DType, StrEnum
 from olmo_core.distributed.parallel.tensor_parallel import SequenceParallel
@@ -201,6 +201,8 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
     dtype: DType = DType.float32
     sliding_window: Optional[SlidingWindowAttentionConfig] = None
     use_head_qk_norm: Optional[bool] = None
+    attention_sink: bool = False
+    attention_sink_init_value: float = -10.0
 
     def num_params(self, d_model: int) -> int:
         """
@@ -254,6 +256,9 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
             params += n_heads * head_dim
             params += n_kv_heads * head_dim
 
+        if self.attention_sink:
+            params += n_heads
+
         return params
 
     def build(
@@ -273,6 +278,14 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
         """
         kwargs = self.as_dict(exclude_none=True, recurse=False)
         kwargs.pop("name")
+        attention_sink = bool(kwargs.get("attention_sink", False))
+        if attention_sink and self.name != AttentionType.default:
+            raise OLMoConfigurationError(
+                f"attention sinks are only supported with default attention (got '{self.name}')"
+            )
+        if not attention_sink:
+            kwargs.pop("attention_sink", None)
+            kwargs.pop("attention_sink_init_value", None)
 
         sliding_window_config: Optional[SlidingWindowAttentionConfig] = kwargs.pop(
             "sliding_window", None
@@ -365,6 +378,8 @@ class Attention(SequenceMixer):
         init_device: str = "cpu",
         cache: Optional[BufferCache] = None,
         use_head_qk_norm: bool = False,
+        attention_sink: bool = False,
+        attention_sink_init_value: float = -10.0,
     ):
         super().__init__()
 
@@ -404,6 +419,11 @@ class Attention(SequenceMixer):
                     dtype=dtype,
                     device=init_device,
                 )
+
+        self.attention_sink_init_value = attention_sink_init_value
+        self.sinks: Optional[nn.Linear] = None
+        if attention_sink:
+            self.sinks = nn.Linear(1, n_heads, bias=False, dtype=torch.float32, device=init_device)
 
         self.clip_qkv = clip_qkv
         self.use_head_qk_norm = use_head_qk_norm
@@ -484,11 +504,20 @@ class Attention(SequenceMixer):
     def cp_enabled(self) -> bool:
         return self.backend.cp_enabled
 
+    def _attention_sink(self) -> Optional[torch.Tensor]:
+        if self.sinks is None:
+            return None
+        sink = self.sinks.weight
+        if isinstance(sink, DTensor):
+            sink = sink.to_local()
+        return sink.reshape(-1)
+
     def sdpa(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        attention_sink: Optional[torch.Tensor] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
         cu_doc_lens_q: Optional[torch.Tensor] = None,
         cu_doc_lens_k: Optional[torch.Tensor] = None,
@@ -500,9 +529,12 @@ class Attention(SequenceMixer):
     ) -> torch.Tensor:
         if self.kv_cache_manager is not None:
             self.kv_cache_manager.record_leftpad(cache_leftpad)
+        if attention_sink is not None and self.cp_enabled:
+            raise RuntimeError("attention sinks are not supported with context parallelism")
         # shape: (batch_size, seq_len, n_heads, head_dim)
         att = self.backend(
             (q, k, v),
+            attention_sink=attention_sink,
             cu_doc_lens=cu_doc_lens,
             cu_doc_lens_q=cu_doc_lens_q,
             cu_doc_lens_k=cu_doc_lens_k,
@@ -623,6 +655,7 @@ class Attention(SequenceMixer):
             q,
             k,
             v,
+            attention_sink=self._attention_sink(),
             cu_doc_lens=cu_doc_lens,
             cu_doc_lens_q=cu_doc_lens_q,
             cu_doc_lens_k=cu_doc_lens_k,
@@ -692,6 +725,16 @@ class Attention(SequenceMixer):
 
         if self.w_g is not None:
             plan["w_g"] = colwise_parallel()
+        if self.sinks is not None:
+            parallelize_module(
+                self.sinks,
+                device_mesh=tp_mesh,
+                parallelize_plan=ColwiseParallel(
+                    input_layouts=Replicate(),
+                    output_layouts=None,
+                    use_local_output=True,
+                ),
+            )
 
         if self.q_norm is not None:
             # if full-dim norm: output is sharded on the embedding dimension (B, T, E [sharded])
@@ -758,6 +801,10 @@ class Attention(SequenceMixer):
             else:
                 g_std = std
             init_linear(self.w_g, std=g_std, generator=generator)
+
+        if self.sinks is not None:
+            with torch.no_grad():
+                self.sinks.weight.fill_(self.attention_sink_init_value)
 
         # Compute std for w_out initialization
         if init_method == InitMethod.fan_in:

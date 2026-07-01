@@ -36,6 +36,8 @@ HF_TO_OLMO_CORE_WEIGHT_MAPPINGS: Dict[str, str] = {
     f"model.layers.{LAYER}.self_attn.k_proj.weight": f"blocks.{LAYER}.attention.w_k.weight",
     f"model.layers.{LAYER}.self_attn.v_proj.weight": f"blocks.{LAYER}.attention.w_v.weight",
     f"model.layers.{LAYER}.self_attn.o_proj.weight": f"blocks.{LAYER}.attention.w_out.weight",
+    f"model.layers.{LAYER}.self_attn.sinks": f"blocks.{LAYER}.attention.sinks.weight",
+    f"model.layers.{LAYER}.self_attn.sinks.weight": f"blocks.{LAYER}.attention.sinks.weight",
     # MLP.
     f"model.layers.{LAYER}.mlp.gate_proj.weight": f"blocks.{LAYER}.feed_forward.w1.weight",
     f"model.layers.{LAYER}.mlp.down_proj.weight": f"blocks.{LAYER}.feed_forward.w2.weight",
@@ -183,6 +185,7 @@ OLMO_CORE_TO_HF_WEIGHT_MAPPINGS: Dict[str, str] = {
     f"blocks.{LAYER}.attention.w_k.weight": f"model.layers.{LAYER}.self_attn.k_proj.weight",
     f"blocks.{LAYER}.attention.w_v.weight": f"model.layers.{LAYER}.self_attn.v_proj.weight",
     f"blocks.{LAYER}.attention.w_out.weight": f"model.layers.{LAYER}.self_attn.o_proj.weight",
+    f"blocks.{LAYER}.attention.sinks.weight": f"model.layers.{LAYER}.self_attn.sinks",
     # MLP.
     f"blocks.{LAYER}.feed_forward.w1.weight": f"model.layers.{LAYER}.mlp.gate_proj.weight",
     f"blocks.{LAYER}.feed_forward.w2.weight": f"model.layers.{LAYER}.mlp.down_proj.weight",
@@ -431,6 +434,13 @@ def _apply_gemma3_norm_transform(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
+def _reshape_attention_sink_from_hf(state: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in list(state.items()):
+        if key.endswith(".attention.sinks.weight") and isinstance(value, torch.Tensor) and value.dim() == 1:
+            state[key] = value.unsqueeze(-1).contiguous()
+    return state
+
+
 def _convert_state(
     config: PretrainedConfig,
     state: Dict[str, Any],
@@ -469,6 +479,7 @@ def convert_state_from_hf(
     converter = _get_converter_from_hf(model_type=model_type)
 
     converted_state = _convert_state(config, hf_state, converter)
+    converted_state = _reshape_attention_sink_from_hf(converted_state)
 
     if model_type == "gemma3_text":
         converted_state = _apply_gemma3_norm_transform(converted_state)
@@ -528,6 +539,13 @@ def _apply_gemma3_norm_inverse_transform(state: Dict[str, Any]) -> Dict[str, Any
     return state
 
 
+def _reshape_attention_sink_to_hf(state: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in list(state.items()):
+        if key.endswith(".self_attn.sinks") and isinstance(value, torch.Tensor) and value.dim() == 2 and value.shape[-1] == 1:
+            state[key] = value.squeeze(-1).contiguous()
+    return state
+
+
 @beta_feature
 def convert_state_to_hf(
     config: PretrainedConfig, olmo_core_state: Dict[str, Any]
@@ -543,6 +561,7 @@ def convert_state_to_hf(
     converter = _get_converter_to_hf(config.model_type)
 
     converted_state = _convert_state(config, olmo_core_state, converter)
+    converted_state = _reshape_attention_sink_to_hf(converted_state)
 
     if config.model_type == "gemma3_text":
         converted_state = _apply_gemma3_norm_inverse_transform(converted_state)

@@ -97,7 +97,20 @@ def _get_transformer_config(
     return result
 
 
-def _get_tokenizer_config(tokenizer_id: str) -> TokenizerConfig:
+def _get_tokenizer_config(tokenizer_id: str, checkpoint_input_path: str | None = None) -> TokenizerConfig:
+    if tokenizer_id.lower() in {"auto", "hf"}:
+        if checkpoint_input_path is None:
+            raise ValueError("--tokenizer auto requires --checkpoint-input-path")
+        with cached_path(f"{checkpoint_input_path}/config.json").open("r", encoding="utf-8") as f:
+            config = json.load(f)
+        return TokenizerConfig(
+            vocab_size=config["vocab_size"],
+            eos_token_id=config["eos_token_id"],
+            pad_token_id=config.get("pad_token_id", config["eos_token_id"]),
+            bos_token_id=config.get("bos_token_id"),
+            identifier=checkpoint_input_path,
+        )
+
     tokenizer_configs = {
         "dolma2": TokenizerConfig.dolma2,
         "gpt_neox_olmo_dolma_v1_5": TokenizerConfig.gpt_neox_olmo_dolma_v1_5,
@@ -119,6 +132,8 @@ def convert_checkpoint_from_hf(
     device: torch.device | None = None,
     validation_device: torch.device | None = None,
     validation_sliding_window: int | None = None,
+    attention_sink: bool = False,
+    attention_sink_init_value: float = -10.0,
 ) -> None:
     """
     Convert a HF checkpoint to an OLMo core checkpoint.
@@ -140,8 +155,6 @@ def convert_checkpoint_from_hf(
         del transformer_config_dict["float8_config"]
 
     model_config = TransformerConfig.from_dict(transformer_config_dict)
-    rich.print(model_config)
-
     validation_device = validation_device or torch.device("cpu")
 
     assert isinstance(model_config.block, TransformerBlockConfig)
@@ -151,6 +164,27 @@ def convert_checkpoint_from_hf(
             (f"block override {idx}", block_config)
             for idx, block_config in sorted(model_config.block_overrides.items())
         )
+
+    if attention_sink:
+        for block_label, block_config in block_entries:
+            attention_config = block_config.sequence_mixer
+            if not isinstance(attention_config, AttentionConfig):
+                raise NotImplementedError(
+                    f"Block {block_label} has an unsupported sequence mixing config: {attention_config}"
+                )
+            if attention_config.name != AttentionType.default:
+                raise NotImplementedError(
+                    f"Attention sinks require default OLMo attention for {block_label}; got {attention_config.name}"
+                )
+            attention_config.attention_sink = True
+            attention_config.attention_sink_init_value = attention_sink_init_value
+        log.info(
+            "Enabled attention sinks during HF conversion for %d block config(s), init_value=%s",
+            len(block_entries),
+            attention_sink_init_value,
+        )
+
+    rich.print(model_config)
 
     def prepare_block_for_conversion(
         block_label: str, block_config: TransformerBlockConfig
@@ -564,7 +598,7 @@ def parse_args():
         "-t",
         "--tokenizer",
         type=str,
-        default="dolma2",
+        default="auto",
         help="OLMo Core tokenizer corresponding to the HF model. New tokenizers should be added to ``_get_tokenizer_config``. This is required when an OLMo Core experiment config is not provided.",
     )
 
@@ -612,6 +646,17 @@ def parse_args():
         help="If set, overrides the model's sliding window size during validation. Useful for checking that sliding window is correctly implemented.",
         type=int,
     )
+    parser.add_argument(
+        "--attention-sink",
+        action="store_true",
+        help="Build OLMo-core attention sink parameters while converting an HF checkpoint.",
+    )
+    parser.add_argument(
+        "--attention-sink-init-value",
+        type=float,
+        default=-10.0,
+        help="Initial sink value if the HF checkpoint does not contain trained sink weights.",
+    )
     return parser.parse_args()
 
 
@@ -626,7 +671,7 @@ def main():
     else:
         assert args.model_arch is not None
         assert args.tokenizer is not None
-        tokenizer_config = _get_tokenizer_config(args.tokenizer)
+        tokenizer_config = _get_tokenizer_config(args.tokenizer, args.checkpoint_input_path)
 
         # We still need to load the HF config, to get the right sequence length.
         with cached_path(args.config_path or f"{args.checkpoint_input_path}/config.json").open(
@@ -645,6 +690,20 @@ def main():
     assert transformer_config_dict is not None
     assert tokenizer_config_dict is not None
 
+    with cached_path(args.config_path or f"{args.checkpoint_input_path}/config.json").open(
+        "r", encoding="utf-8"
+    ) as f:
+        hf_config_dict = json.load(f)
+    architectures = hf_config_dict.get("architectures") or []
+    attention_sink = (
+        args.attention_sink
+        or hf_config_dict.get("model_type") == "olmo3_sink"
+        or "Olmo3SinkForCausalLM" in architectures
+    )
+    attention_sink_init_value = float(
+        hf_config_dict.get("sink_init_value", args.attention_sink_init_value)
+    )
+
     convert_checkpoint_from_hf(
         hf_checkpoint_path=args.checkpoint_input_path,
         hf_revision=args.revision,
@@ -656,6 +715,8 @@ def main():
         device=args.device,
         validation_device=args.validation_device or args.device,
         validation_sliding_window=args.validation_sliding_window,
+        attention_sink=attention_sink,
+        attention_sink_init_value=attention_sink_init_value,
     )
 
 
